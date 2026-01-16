@@ -1,0 +1,682 @@
+
+# import data
+vr <- vaccination_full
+
+vr <- vr %>%
+  distinct()
+
+vr <- vr %>% select(-gwno.y, -gwno.x)
+
+#NA analysis
+colSums(is.na(vr))
+
+colMeans(is.na(vr)) * 100
+
+library(naniar)
+vis_miss(vr %>% slice_sample(n=200))
+
+library(mice)
+md.pattern(vr)
+
+library(naniar)
+gg_miss_upset(vr)
+
+
+summary(lm(Coverage ~ log(Total+1)*log(bd_best+1) + log(Total.Deaths+1) + factor(Country.Code) + factor(Year),data=vr))
+
+
+
+### Add SERF low-income right to health as an alternate confounder
+serf <- read.csv('~/Documents/Displaced Persons Vaccination Coverage/SERF2024_Download_LIC.csv')
+serf <- serf %>% 
+  select(Country.Code, Country.Name, Index.Year, LMY.Right.to.Health.Score)
+
+vr_serf <- vr %>%
+  left_join(
+    serf,
+    by = c("Country.Code"="Country.Code","Year"="Index.Year")
+  )
+
+vr_serf$intensity_level[which(vr_serf$intensity_level=='1.none')] <- NA
+vr_serf$intensity_level[which(vr_serf$intensity_level=='2.minor')] <- 1
+vr_serf$intensity_level[which(vr_serf$intensity_level=='3.war')] <- 2
+vr_serf$intensity_level <- as.numeric(vr_serf$intensity_level)
+
+
+#v2pehealth
+vdem <- read.csv('~/Documents/Displaced Persons Vaccination Coverage/VDEM/V-Dem-CY-Core-v15.csv')
+vdem <- vdem %>% 
+  select(country_text_id, year, v2pehealth, v2pehealth_ord)
+
+vr_serf <- vr_serf %>% 
+  left_join(
+    vdem,
+    by = c('Country.Code'="country_text_id",'year'='year'),
+    unmatched = "drop"
+  )
+
+
+#wb_population data
+wbpop <- read.csv('~/Documents/Displaced Persons Vaccination Coverage/WB_Population Data.csv')
+library(dplyr)
+library(tidyr)
+library(stringr)
+
+# Reshape wbpop from wide to long
+wbpop_long <- wbpop %>%
+  pivot_longer(
+    cols = starts_with("X"), 
+    names_to = "Year",
+    values_to = "Population"
+  ) %>%
+  # Extract numeric year from the column names (e.g., "X2000..YR2000." → 2000)
+  mutate(Year = str_extract(Year, "\\d{4}"),
+         Year = as.integer(Year))
+
+# Now join to vr_serf by Country.Code and Year
+vr_serf <- vr_serf %>%
+  left_join(wbpop_long %>% select(Country.Code, Year, Population),
+            by = c("Country.Code", "Year"))
+
+vr_serf$Population <- as.numeric(vr_serf$Population)
+
+vr_serf$displaced_pct <- vr_serf$Total/vr_serf$Population
+
+#=========================
+# Function to prepare data and estimate DiD
+#=========================
+library(dplyr)
+library(fixest)
+library(broom)
+
+run_did_analysis <- function(df, growth_threshold = 0.5, absolute_threshold = 100000) {
+  # Step 1: Identify shocks
+  df <- df %>%
+    group_by(Country.Code, vaccine) %>%
+    arrange(Year) %>%
+    mutate(
+      lag_total = lag(Total),
+      displacement_growth = if_else(lag_total > 0, (Total - lag_total) / lag_total, NA_real_),
+      shock = if_else(
+        displacement_growth >= growth_threshold & Total >= absolute_threshold,
+        1,
+        0
+      )
+    ) %>%
+    ungroup()
+  
+  # Step 2: First shock year per country
+  shock_years <- df %>%
+    filter(shock == 1) %>%
+    group_by(Country.Code) %>%
+    summarize(first_shock_year = min(Year), .groups = "drop")
+  
+  
+  # Step 3: Merge and create treatment indicators
+  # df <- df %>% #first year only
+  #   left_join(shock_years, by = "Country.Code") %>%
+  #   group_by(Country.Code, vaccine) %>%
+  #   arrange(Year) %>%
+  #   mutate(
+  #     treat = if_else(!is.na(first_shock_year), 1, 0),
+  #     # post is now only TRUE in the first shock year
+  #     post = if_else(Year == first_shock_year & treat == 1, 1, 0),
+  #     # treatment_status is 1 only for first post-shock year
+  #     treatment_status = if_else(treat == 1 & post == 1, 1, 0),
+  #     GDP_per_capita_lag = lag(GDP_per_capita)
+  #   ) %>%
+  #   ungroup()
+  
+  df <- df %>% # first THREE years
+    left_join(shock_years, by = "Country.Code") %>%
+    group_by(Country.Code, vaccine) %>%
+    arrange(Year) %>%
+    mutate(
+      treat = if_else(!is.na(first_shock_year), 1, 0),
+      # TRUE for the first three years after shock (shock year, shock year+1, shock year+2)
+      post = if_else(
+        Year >= first_shock_year & Year <= first_shock_year + 2 & treat == 1,
+        1, 0
+      ),
+      # treatment_status is also 1 for exactly those three years
+      treatment_status = post,
+      GDP_per_capita_lag = lag(GDP_per_capita)
+    ) %>%
+    ungroup()
+  
+  
+  # Step 3b: Create conflict intensity category
+  df <- df %>%
+    mutate(
+      conflict_cat = case_when(
+        is.na(intensity_level) ~ "None",
+        intensity_level == 1 ~ "Low-level",
+        intensity_level >= 2 ~ "War"
+      ),
+      conflict_cat = factor(conflict_cat, levels = c("None", "Low-level", "War"))
+    )
+  
+  did_model <- feols(
+    Coverage ~ treatment_status * conflict_cat + log(GDP_per_capita_lag) | vaccine + Year,
+    data = df,
+    cluster = ~Country.Code
+  )
+  
+  # Step 5: Event Study Preparation
+  df_es <- df %>%
+    mutate(event_time = Year - first_shock_year) %>%
+    filter(event_time >= -5, event_time <= 5) %>%
+    mutate(event_time_factor = factor(event_time))
+  
+  # Step 6: Event Study Regression (with conflict category)
+  es_model <- feols(
+    Coverage ~ i(event_time_factor, ref = "-1") + log(GDP_per_capita_lag) + conflict_cat | vaccine + Year,
+    data = df_es,
+    cluster = ~Country.Code
+  )
+  
+  # Step 7: Format outputs
+  did_summary <- broom::tidy(did_model) %>%
+    filter(term == "treatment_status") %>%
+    select(term, estimate, std.error, p.value)
+  
+  es_summary <- broom::tidy(es_model) %>%
+    filter(grepl("event_time_factor::", term)) %>%
+    mutate(event_time = as.numeric(gsub("event_time_factor::", "", term))) %>%
+    select(event_time, estimate, std.error, p.value)
+  
+  # Step 7: Parallel trend test (any pre-event coeff p < 0.05)
+  pretrend_fail <- any(es_summary$p.value[es_summary$event_time < 0] < 0.05, na.rm = TRUE)
+  
+  return(list(
+    did_model = did_model,
+    event_study_model = es_model,
+    did_summary = did_summary,
+    es_summary = es_summary,
+    pretrend_fail = pretrend_fail
+  ))
+}
+
+
+
+results <- run_did_analysis(
+  df = vr_serf,
+  growth_threshold = 1.0,
+  absolute_threshold = 500000
+)
+
+# Extract all relevant terms from the DiD model
+did_summary_all <- broom::tidy(results$did_model) %>%
+  filter(term %in% c(
+    "treatment_status", 
+    "conflict_catLow-level", 
+    "conflict_catWar",
+    "treatment_status:conflict_catLow-level",
+    "treatment_status:conflict_catWar"
+  )) %>%
+  mutate(
+    conf.low = estimate - 1.96 * std.error,
+    conf.high = estimate + 1.96 * std.error,
+    formatted = sprintf("%.2f (%.2f, %.2f)", estimate, conf.low, conf.high)
+  )
+
+# Update the stored results
+results$did_summary <- did_summary_all
+
+# View DiD result
+print(results$did_summary, width = Inf)
+
+# View pre-trend check: subset to pre-period only
+results$es_summary %>% 
+  filter(event_time < 0)
+
+
+
+### RERUN ANALYSIS WITH POPULATION DISPLACEMENT IN PCT TERMS
+#=========================
+# Function to prepare data and estimate DiD
+#=========================
+library(dplyr)
+library(fixest)
+library(broom)
+
+run_did_analysis <- function(df, growth_threshold = 0.5, pct_threshold = 0.05) {
+  # Step 1: Identify shocks based on displaced_pct
+  df <- df %>%
+    group_by(Country.Code, vaccine) %>%
+    arrange(Year) %>%
+    mutate(
+      lag_pct = lag(displaced_pct),
+      displacement_growth = if_else(lag_pct > 0, (displaced_pct - lag_pct) / lag_pct, NA_real_),
+      shock = if_else(
+        displacement_growth >= growth_threshold & displaced_pct >= pct_threshold,
+        1, 0
+      )
+    ) %>%
+    ungroup()
+  
+  # Step 2: First shock year per country
+  shock_years <- df %>%
+    filter(shock == 1) %>%
+    group_by(Country.Code) %>%
+    summarize(first_shock_year = min(Year), .groups = "drop")
+  
+  #shock year only: 
+  # df <- df %>%
+  #   left_join(shock_years, by = "Country.Code") %>%
+  #   group_by(Country.Code, vaccine) %>%
+  #   arrange(Year) %>%
+  #   mutate(
+  #     treat = if_else(!is.na(first_shock_year), 1, 0),
+  #     post = if_else(Year == first_shock_year & treat == 1, 1, 0),
+  #     treatment_status = post,
+  #     GDP_per_capita_lag = lag(GDP_per_capita)
+  #   ) %>%
+  #   ungroup()
+  # 
+  
+  # Step 3: Treatment indicators (first 3 years after shock)
+  df <- df %>%
+    left_join(shock_years, by = "Country.Code") %>%
+    group_by(Country.Code, vaccine) %>%
+    arrange(Year) %>%
+    mutate(
+      treat = if_else(!is.na(first_shock_year), 1, 0),
+      post = if_else(
+        Year >= first_shock_year & Year <= first_shock_year + 2 & treat == 1,
+        1, 0
+      ),
+      treatment_status = post,
+      GDP_per_capita_lag = lag(GDP_per_capita)
+    ) %>%
+    ungroup()
+  
+  df <- df %>%
+    left_join(shock_years, by = "Country.Code") %>%
+    group_by(Country.Code, vaccine) %>%
+    arrange(Year) %>%
+    mutate(
+      treat = if_else(!is.na(first_shock_year), 1, 0),
+      # post = 1 only in the first shock year
+      post = if_else(Year == first_shock_year & treat == 1, 1, 0),
+      # treatment_status is 1 only in the shock year
+      treatment_status = post,
+      GDP_per_capita_lag = lag(GDP_per_capita)
+    ) %>%
+    ungroup()
+  
+  # Step 3b: Conflict category
+  df <- df %>%
+    mutate(
+      conflict_cat = case_when(
+        is.na(intensity_level) ~ "None",
+        intensity_level == 1 ~ "Low-level",
+        intensity_level >= 2 ~ "War"
+      ),
+      conflict_cat = factor(conflict_cat, levels = c("None", "Low-level", "War"))
+    )
+  
+  # Step 4: DiD model
+  did_model <- feols(
+    Coverage ~ treatment_status * conflict_cat + log(GDP_per_capita_lag) | vaccine + Year,
+    data = df,
+    cluster = ~Country.Code
+  )
+  
+  # Step 5: Event Study Prep
+  df_es <- df %>%
+    mutate(event_time = Year - first_shock_year) %>%
+    filter(event_time >= -5, event_time <= 5) %>%
+    mutate(event_time_factor = factor(event_time))
+  
+  # Step 6: Event Study
+  es_model <- feols(
+    Coverage ~ i(event_time_factor, ref = "-1") + log(GDP_per_capita_lag) + conflict_cat | vaccine + Year,
+    data = df_es,
+    cluster = ~Country.Code
+  )
+  
+  # Step 7: Format outputs
+  did_summary <- broom::tidy(did_model) %>%
+    filter(term == "treatment_status") %>%
+    select(term, estimate, std.error, p.value)
+  
+  es_summary <- broom::tidy(es_model) %>%
+    filter(grepl("event_time_factor::", term)) %>%
+    mutate(event_time = as.numeric(gsub("event_time_factor::", "", term))) %>%
+    select(event_time, estimate, std.error, p.value)
+  
+  return(list(
+    did_model = did_model,
+    event_study_model = es_model,
+    did_summary = did_summary,
+    es_summary = es_summary
+  ))
+}
+
+
+results <- run_did_analysis(
+  df = vr_serf,
+  growth_threshold = 1.0,   # requires 100% increase in displaced_pct
+  pct_threshold = 0.15     # requires displaced ≥ 5% of pop
+)
+
+
+# Extract tidy results
+tidy_did <- broom::tidy(results$did_model)
+
+# Only keep key terms that actually exist in this model
+key_terms <- c(
+  "treatment_status", 
+  "conflict_catLow-level", 
+  "conflict_catWar",
+  "treatment_status:conflict_catLow-level",
+  "treatment_status:conflict_catWar"
+)
+
+did_summary_clean <- tidy_did %>%
+  filter(term %in% key_terms) %>%
+  mutate(
+    conf.low  = estimate - 1.96 * std.error,
+    conf.high = estimate + 1.96 * std.error,
+    formatted = sprintf("%.2f (%.2f, %.2f)", estimate, conf.low, conf.high)
+  )
+
+# Update results list
+results$did_summary <- did_summary_clean
+
+# Print
+print(results$did_summary, width = Inf)
+
+# View pre-trend event study estimates for pre-period
+pretrend_summary <- results$es_summary %>%
+  filter(event_time < 0)
+
+print(pretrend_summary, width = Inf)
+
+
+#### graph percentage cutoffs
+library(tidyverse)
+library(broom)
+library(fixest)
+library(purrr)
+
+# --- Robust run function ---
+run_did_analysis <- function(df, growth_threshold = 0.5, pct_threshold = 0.05) {
+  # Step 1: Identify shocks
+  df <- df %>%
+    group_by(Country.Code, vaccine) %>%
+    arrange(Year) %>%
+    mutate(
+      lag_pct = lag(displaced_pct),
+      displacement_growth = if_else(lag_pct > 0,
+                                    (displaced_pct - lag_pct) / lag_pct,
+                                    NA_real_),
+      shock = if_else(
+        displacement_growth >= growth_threshold &
+          displaced_pct >= pct_threshold,
+        1, 0
+      )
+    ) %>%
+    ungroup()
+  
+  # Step 2: First shock year
+  shock_years <- df %>%
+    filter(shock == 1) %>%
+    group_by(Country.Code) %>%
+    summarize(first_shock_year = min(Year), .groups = "drop")
+  
+  # Step 3: Treatment indicator (first 3 years after shock)
+  df <- df %>%
+    left_join(shock_years, by = "Country.Code") %>%
+    group_by(Country.Code, vaccine) %>%
+    arrange(Year) %>%
+    mutate(
+      treat = if_else(!is.na(first_shock_year), 1, 0),
+      post = if_else(
+        Year >= first_shock_year & Year <= first_shock_year + 2 & treat == 1,
+        1, 0
+      ),
+      treatment_status = post,
+      GDP_per_capita_lag = lag(GDP_per_capita)
+    ) %>%
+    ungroup()
+  
+  # Step 3b: Conflict category
+  df <- df %>%
+    mutate(
+      conflict_cat = case_when(
+        is.na(intensity_level) ~ "None",
+        intensity_level == 1 ~ "Low-level",
+        intensity_level >= 2 ~ "War"
+      ),
+      conflict_cat = factor(conflict_cat, levels = c("None", "Low-level", "War"))
+    )
+  
+  # Step 4: DiD model (safe)
+  did_model <- tryCatch(
+    feols(
+      Coverage ~ treatment_status * conflict_cat + log(GDP_per_capita_lag) | vaccine + Year,
+      data = df,
+      cluster = ~Country.Code
+    ),
+    error = function(e) NULL
+  )
+  
+  did_summary <- if (!is.null(did_model)) {
+    broom::tidy(did_model)
+  } else {
+    tibble(term = character(), estimate = numeric(), std.error = numeric(), p.value = numeric())
+  }
+  
+  # Step 5: Event Study data
+  df_es <- df %>%
+    mutate(event_time = Year - first_shock_year) %>%
+    filter(!is.na(event_time), event_time >= -5, event_time <= 5) %>%
+    mutate(event_time_factor = factor(event_time))
+  
+  # Step 6: Event Study model (safe, only if pre/post exist)
+  es_model <- NULL
+  es_summary <- tibble(event_time = numeric(), estimate = numeric(),
+                       std.error = numeric(), p.value = numeric())
+  
+  if (any(df_es$event_time < 0, na.rm = TRUE) & any(df_es$event_time > 0, na.rm = TRUE)) {
+    es_model <- tryCatch(
+      feols(
+        Coverage ~ i(event_time_factor, ref = "-1") +
+          log(GDP_per_capita_lag) + conflict_cat | vaccine + Year,
+        data = df_es,
+        cluster = ~Country.Code
+      ),
+      error = function(e) NULL
+    )
+    
+    if (!is.null(es_model)) {
+      es_summary <- broom::tidy(es_model) %>%
+        filter(grepl("event_time_factor::", term)) %>%
+        mutate(event_time = as.numeric(gsub("event_time_factor::", "", term))) %>%
+        select(event_time, estimate, std.error, p.value)
+    }
+  }
+  
+  # Step 7: Parallel trend test (any pre-event coeff p < 0.05)
+  pretrend_fail <- any(es_summary$p.value[es_summary$event_time < 0] < 0.05, na.rm = TRUE)
+  
+  return(list(
+    did_summary = did_summary,
+    es_summary = es_summary,
+    pretrend_fail = pretrend_fail
+  ))
+}
+
+################################
+
+results <- run_did_analysis(
+  df = vr_serf,
+  growth_threshold = 0.5,
+  pct_threshold = 0.10
+)
+
+# Access DiD summary
+results$did_summary
+
+# Access event study summary
+results$es_summary
+
+
+
+# Extract all relevant terms from the DiD model
+did_summary_all <- broom::tidy(results$did_model) %>%
+  filter(term %in% c(
+    "treatment_status", 
+    "conflict_catLow-level", 
+    "conflict_catWar",
+    "treatment_status:conflict_catLow-level",
+    "treatment_status:conflict_catWar"
+  )) %>%
+  mutate(
+    conf.low = estimate - 1.96 * std.error,
+    conf.high = estimate + 1.96 * std.error,
+    formatted = sprintf("%.2f (%.2f, %.2f)", estimate, conf.low, conf.high)
+  )
+
+# Update the stored results
+results$did_summary <- did_summary_all
+
+# View DiD result
+print(results$did_summary, width = Inf)
+
+# View pre-trend check: subset to pre-period only
+results$es_summary %>% 
+  filter(event_time < 0)
+
+
+################################
+
+
+# --- Run all combinations robustly ---
+results <- run_did_analysis(
+  df = vr_serf,
+  growth_threshold = 1.0,   # requires 100% increase in displaced_pct
+  pct_threshold = 0.15     # requires displaced ≥ 5% of pop
+)
+
+
+growth_thresholds <- c(0.5, 0.75, 1.0)
+pct_cutoffs <- seq(0, 0.25, by = 0.01)
+# absolute_threshold <- seq(0,750000,by=10000)
+
+results_grid <- expand_grid(
+  growth_threshold = growth_thresholds,
+  pct_threshold = pct_cutoffs
+  # absolute_threshold = absolute_threshold
+) %>%
+  mutate(
+    model = map2(growth_threshold, pct_threshold, #absolute_threshold,#
+                 ~ run_did_analysis(vr_serf,
+                                    growth_threshold = .x,
+                                    # absolute_threshold = .y))
+                                    pct_threshold = .y))
+  ) %>%
+  mutate(
+    did_summary = map(model, "did_summary"),
+    es_summary = map(model, "es_summary"),
+    pretrend_fail = map_lgl(model, "pretrend_fail")
+  ) %>%
+  select(-model) %>%
+  unnest(did_summary)
+
+
+library(ggplot2)
+
+plot_data <- results_grid %>%
+  filter(term == "treatment_status") %>%
+  group_by(growth_threshold, pct_threshold) %>% # absolute_threshold
+  summarise(
+    estimate = mean(estimate, na.rm = TRUE),
+    std.error = mean(std.error, na.rm = TRUE),
+    pretrend_fail = any(pretrend_fail),
+    .groups = "drop"
+  )
+
+# Prepare the data (ensure no duplicates)
+plot_data_clean <- plot_data %>%
+  group_by(growth_threshold, pct_threshold) %>% #absolute_threshold
+  summarise(
+    estimate = mean(estimate, na.rm = TRUE),
+    std.error = mean(std.error, na.rm = TRUE),
+    pretrend_fail = any(pretrend_fail),
+    .groups = "drop"
+  )
+
+ggplot(plot_data, aes(x = absolute_threshold, y = estimate, group = 1)) + #
+  geom_line(aes(color = pretrend_fail)) +
+  geom_ribbon(aes(ymin = estimate - 1.96*std.error,
+                  ymax = estimate + 1.96*std.error),
+              fill = "gray", alpha = 0.2) +
+  facet_wrap(~growth_threshold,
+             labeller = labeller(growth_threshold = c(
+               "0.5" = "50%",
+               "0.75" = "75%",
+               "1" = "100%"
+             ))) +
+  scale_x_continuous(labels = scales::percent_format(accuracy = 1)) +
+  scale_color_manual(values = c("FALSE" = "green3", "TRUE" = "red3")) +
+  theme_minimal(base_size = 14) +
+  labs(x = "Displacement % threshold",
+       y = "DiD estimate (coverage effect)",
+       color = "Pre-trend violated?")
+
+# Plot
+# Plot
+ggplot(plot_data_clean, aes(x = pct_threshold * 100, y = estimate, group = 1)) + #  absolute_threshold
+  # Confidence ribbon
+  geom_ribbon(aes(ymin = estimate - 1.96 * std.error,
+                  ymax = estimate + 1.96 * std.error),
+              fill = "lightblue", alpha = 0.25) +
+  # Line for DiD estimate
+  geom_line(aes(color = pretrend_fail), size = 1.2) +
+  # Points at each threshold
+  geom_point(aes(color = pretrend_fail), size = 2) +
+  # Vertical dashed line at 10% threshold
+  # geom_vline(xintercept = 10, linetype = "dashed", color = "gray70") +
+  # Facet by growth threshold with clear separation
+  facet_wrap(~growth_threshold,
+             labeller = labeller(growth_threshold = c(
+               "0.5" = "Annual growth threshold: 50%",
+               "0.75" = "Annual growth threshold: 75%",
+               "1" = "Annual growth threshold: 100%"
+             )),
+             strip.position = "top") +
+  # Scales and colors
+  scale_x_continuous(
+    labels = function(x) ifelse(x < 25, paste0(x, "%"), ""),  # remove 25% label
+    limits = c(0, 25),
+    expand = expansion(mult = c(0.02, 0.02))
+  ) +
+  # scale_x_continuous(
+  #   labels = scales::label_number(big.mark = ","),
+  #   breaks = seq(0, 750000, by = 200000)
+  # ) +
+  scale_color_manual(values = c("FALSE" = "#1f77b4", "TRUE" = "#d62728")) +
+  # Theme refinements for Nature-style panels
+  theme_minimal(base_size = 14) +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    panel.grid.major.y = element_line(color = "gray90"),
+    legend.position = "top",
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 11),
+    strip.background = element_rect(fill = "gray95", color = "gray80"),
+    panel.border = element_rect(color = "gray80", fill = NA, size = 0.7)
+  ) +
+  # Labels
+  labs(
+    x = "Displaced share of total population (%)", # Displaced Population
+    y = "Estimated change in vaccination coverage (%)",
+    color = "Parallel pre-trend violated?",
+    fill = "95% CI"
+  )
+
+
