@@ -1,0 +1,1815 @@
+##### IMPORT DATA AND CONDUCT DESCRIPTIVE ANALYSES #####
+# rm(list=ls())
+
+
+library(fixest)
+library(ggplot2)
+library(dplyr)
+library(purrr)
+library(readxl)
+library(tidyr)
+
+
+
+# Load data
+sheets <- c("BCG", "DTP1", "DTP3", "HEPB3", "HEPBB", "HIB3", "MCV1", "MCV2", "PCV3", "POL3", "RCV1", "ROTAC") #excluded YFV and IPV1 and IPV2
+
+# Step 2: Read and combine all sheets properly
+vaccine_long <- map_dfr(sheets, function(sheet) {
+  read_excel("~/Documents/Maternal Health and Policy Frameworks/WHO UNICEF Joint Estimates.xlsx", sheet = sheet) %>%
+    pivot_longer(
+      cols = starts_with("20") | starts_with("19"),  # year columns
+      names_to = "Year",
+      values_to = "Coverage"
+    ) %>%
+    mutate(
+      Year = as.integer(Year),
+      vaccine = sheet   # Use the current sheet name as the vaccine
+    ) %>%
+    select(
+      Country = country,
+      Country.Code = iso3,
+      Year,
+      vaccine,
+      Coverage
+    )
+})
+
+# Load UNHCR Data
+displaced <- read.csv('~/Documents/Maternal Health and Policy Frameworks/persons_of_concern_demographics.csv')
+
+displaced_subset <- displaced %>%
+  select(
+    Year,
+    Country.of.Origin.ISO,
+    Female.0...4,
+    Female.Total,
+    Male.0...4,
+    Male.Total,
+    Total
+  )
+
+# Merge into vaccine_long
+vaccine_long_merged <- vaccine_long %>%
+  left_join(
+    displaced_subset,
+    by = c("Country.Code" = "Country.of.Origin.ISO", "Year" = "Year")
+  )
+
+# we need to DROP HEPBB, ROTAC
+vaccine_long_merged <- vaccine_long_merged[which(vaccine_long_merged$vaccine!="ROTAC" & vaccine_long_merged$vaccine!="HEPBB"),]
+
+
+# add gdp per capita from world bank
+gdppc <- read.csv('~/Documents/Maternal Health and Policy Frameworks/WB GDPpC.csv')
+
+gdppc_long <- gdppc %>%
+  select(Country.Name, Country.Code, starts_with("X")) %>% 
+  pivot_longer(
+    cols = starts_with("X"),
+    names_to = "Year",
+    values_to = "GDP_per_capita"
+  ) %>%
+  mutate(
+    Year = as.integer(sub("X", "", Year))
+  )
+
+vaccine_long_merged <- vaccine_long_merged %>%
+  inner_join(gdppc_long, by = c("Country.Code", "Year"))
+
+
+## add conflict data 
+        # intensity: 1 = minor (between 25 and 999); 2 = war (at least 1,000)
+library(states)
+head(gwstates)
+
+conflict_data <- read.csv('~/Documents/Displaced Persons Vaccination Coverage/UcdpPrioConflict_v25_2.csv')
+
+vaccine_long_merged$Conflict <- 0 
+
+# STEP 1: Create an ISO3-to-GWcode lookup from gwstates
+gw_lookup <- gwstates %>%
+  filter(!is.na(gwcode)) %>%
+  distinct(gwcode, gwc) %>%
+  rename(Country.Code = gwc, gwno = gwcode)
+
+# STEP 2: Merge in gwcode to vaccine data
+vaccine_long_merged_with_gw <- vaccine_long_merged %>%
+  left_join(gw_lookup, by = "Country.Code")
+
+# STEP 3: Summarize conflict_data to country-year level
+# Choose the maximum intensity level recorded in a country-year
+conflict_country_year <- conflict_data %>%
+  filter(!is.na(gwno_loc)) %>%
+  group_by(gwno_loc, year) %>%
+  summarise(intensity_level = max(intensity_level, na.rm = TRUE), .groups = "drop") %>%
+  rename(gwno = gwno_loc)
+
+# STEP 4: Merge conflict intensity into the vaccine data
+vaccine_with_conflict <- vaccine_long_merged_with_gw %>%
+  mutate(gwno = as.character(gwno)) %>%
+  left_join(conflict_country_year %>% mutate(gwno = as.character(gwno)), 
+            by = c("gwno", "Year" = "year"))
+
+vaccine_long_merged <- vaccine_with_conflict
+
+### add in natural disasters 
+disaster_data <- read.csv('~/Documents/Displaced Persons Vaccination Coverage/emdat_2025_natural_disasters.csv')
+disaster_data <- disaster_data[which(disaster_data$Disaster.Type!='Epidemic'),]
+
+# disaster_data$Category <- NA
+# disaster_data$Category[which(disaster_data$Total.Deaths<25|is.na(disaster_data$Total.Deaths))] <- "None"
+# disaster_data$Category[which(disaster_data$Total.Deaths>=25&disaster_data$Total.Deaths<1000)] <- "Low"
+# disaster_data$Category[which(disaster_data$Total.Deaths>=1000)] <- "High"
+
+fatality_summary <- disaster_data %>%
+  group_by(ISO, Start.Year) %>%
+  summarise(
+    sum_fatality = sum(Total.Deaths, na.rm = TRUE),
+    n_missing   = sum(is.na(Total.Deaths))
+  ) %>%
+  ungroup()
+
+head(fatality_summary)
+
+fatality_summary$Category <- NA
+fatality_summary$Category[which(fatality_summary$sum_fatality<25|is.na(fatality_summary$sum_fatality))] <- "None"
+fatality_summary$Category[which(fatality_summary$sum_fatality>=25&fatality_summary$sum_fatality<1000)] <- "Low"
+fatality_summary$Category[which(fatality_summary$sum_fatality>=1000)] <- "High"
+
+# take ISO, Start.Year, Category; if multiple categories... should sum fatalities per country year? 
+library(tidyr)
+vaccine_long_merged_disaster <- vaccine_long_merged
+merged_data <- vaccine_long_merged_disaster %>%
+  left_join(
+    fatality_summary %>% select(ISO, Start.Year, sum_fatality, Category),
+    by = c("Country.Code" = "ISO", "Year" = "Start.Year")
+  ) %>%
+  group_by(Country.Code) %>%
+  arrange(Year, .by_group = TRUE) %>%
+  fill(sum_fatality, Category, .direction = "down") %>%
+  ungroup()
+
+head(merged_data)
+
+### ANALYSIS ### 
+# Average displaced population per country-year
+
+vaccine_long_merged <- vaccine_long_merged %>%
+  mutate(
+    displacement_group = ntile(Total, 5),  # Quintiles 1–5
+    displacement_group = factor(
+      displacement_group,
+      levels = 1:5,
+      labels = c("Lowest displacement", "Low-mid", "Mid", "High-mid", "Highest displacement")
+    )
+  )
+
+
+ggplot(
+  vaccine_long_merged %>% 
+    filter(!is.na(Coverage), !is.na(displacement_group)),
+  aes(x = Year, y = Coverage, color = displacement_group, group = displacement_group)
+) +
+  stat_summary(fun = mean, geom = "line", size = 1.2,alpha=0.75) +
+  labs(
+    title = "Vaccination Coverage Trends by Displacement Burden (2000–2024)",
+    subtitle = "Grouped by total displaced persons per country-year",
+    x = "Year",
+    y = "Average Coverage (%)",
+    color = "Displacement burden"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "right",
+    text = element_text(size = 12),
+    plot.title = element_text(face = "bold", size = 14)
+  )
+
+
+
+model <- feols(
+  Coverage ~ displacement_group + log(GDP_per_capita) | vaccine + Year,
+  data = vaccine_long_merged
+)
+
+summary(model)
+confint(model, level = 0.95)
+
+model.a <- feols(
+  Coverage ~ displacement_group + GDP_per_capita | vaccine + Year,
+  data = vaccine_long_merged
+)
+
+summary(model.a)
+confint(model.a, level = 0.95)
+
+
+vaccination_descriptive <- vaccine_long_merged
+vaccination_descriptive$intensity_level[which(is.na(vaccination_descriptive$intensity_level))] <- '1.none'
+vaccination_descriptive$intensity_level[which(vaccination_descriptive$intensity_level==1)] <- '2.minor'
+vaccination_descriptive$intensity_level[which(vaccination_descriptive$intensity_level==2)] <- '3.war'
+
+model1 <- feols(
+  Coverage ~ as.factor(intensity_level) | vaccine + Year,
+  data = vaccination_descriptive
+)
+
+summary(model1)
+confint(model1, level = 0.95)
+
+model1.a <- feols(
+  Coverage ~ as.factor(intensity_level) + log(GDP_per_capita) | vaccine + Year,
+  data = vaccination_descriptive
+)
+
+summary(model1.a)
+confint(model1.a, level = 0.95)
+
+
+md1 <- merged_data
+md1$Category[which(md1$Category=='None')] <- "0.None"
+md1$Category[which(md1$Category=='Low')] <- "1.Low"
+md1$Category[which(md1$Category=='High')] <- "2.High"
+
+model1.b <- feols(
+  Coverage ~ as.factor(Category) | vaccine + Year,
+  data = md1
+)
+
+summary(model1.b)
+confint(model1.b, level = 0.95)
+
+
+### Summary Statistics (Figure 1)
+mean(vaccine_long_merged$Coverage,na.rm=T)
+sd(vaccine_long_merged$Coverage,na.rm=T)
+
+vaccine_long_merged %>% group_by(displacement_group) %>% summarize(n = mean(Total,na.rm=T),sd = sd(Total,na.rm=T))
+
+mean(vaccine_long_merged$Total,na.rm=T)
+sd(vaccine_long_merged$Total,na.rm=T)
+vaccine_long_merged %>% group_by(displacement_group) %>% summarize(mn = mean(Coverage,na.rm=T), sd = sd(Coverage,na.rm=T))
+
+table(vaccine_long_merged$intensity_level)
+
+table(vaccine_long_merged$displacement_group)
+table(vaccine_long_merged$displacement_group,vaccine_long_merged$intensity_level)
+
+mean(vaccine_long_merged$GDP_per_capita,na.rm=T)
+sd(vaccine_long_merged$GDP_per_capita,na.rm=T)
+
+vaccine_long_merged %>% group_by(displacement_group) %>% summarize(mn = mean(GDP_per_capita,na.rm=T), sd = sd(GDP_per_capita,na.rm=T))
+
+vaccination_descriptive %>% group_by(intensity_level) %>% summarize(mn=mean(Coverage,na.rm=T), sd=sd(Coverage,na.rm=T))
+ 
+
+### SHOCK SUMMARY STATISTICS
+library(dplyr)
+library(purrr)
+
+# Step 1: define thresholds
+growth_thresholds <- c(0.5, 0.75, 1.0)   # 25%, 50%, 100% growth
+absolute_thresholds <- c(50000, 150000, 250000, 500000)
+
+criteria_grid <- expand.grid(
+  growth_threshold = growth_thresholds,
+  absolute_threshold = absolute_thresholds
+)
+
+# Step 2: clean up conflict categories
+vaccination_descriptive <- vaccination_descriptive %>%
+  mutate(
+    conflict_cat = case_when(
+      grepl("^1", intensity_level) ~ "None",
+      grepl("^2", intensity_level) ~ "Low-level",
+      grepl("^3", intensity_level) ~ "War",
+      TRUE ~ NA_character_
+    )
+  )
+
+# Step 3: function to count shocks under given criteria
+count_shocks <- function(growth_threshold, absolute_threshold, df) {
+  df_shocks <- df %>%
+    group_by(Country.Code, vaccine) %>%
+    arrange(Year) %>%
+    mutate(
+      lag_total = lag(Total),
+      displacement_growth = if_else(lag_total > 0, 
+                                    (Total - lag_total) / lag_total, 
+                                    NA_real_),
+      shock = if_else(
+        displacement_growth >= growth_threshold & Total >= absolute_threshold,
+        1, 0
+      )
+    ) %>%
+    ungroup()
+  
+  # keep only the first shock per country
+  first_shocks <- df_shocks %>%
+    filter(shock == 1) %>%
+    group_by(Country.Code) %>%
+    slice_min(Year, with_ties = FALSE) %>%
+    ungroup()
+  
+  first_shocks %>%
+    group_by(conflict_cat) %>%
+    summarise(
+      n_shocks = n(),  # now equals number of unique countries with ≥1 shock
+      n_countries = n_distinct(Country.Code),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      growth_threshold = growth_threshold,
+      absolute_threshold = absolute_threshold
+    )
+}
+
+# Step 4: run across all combinations
+shock_counts <- map2_dfr(
+  criteria_grid$growth_threshold,
+  criteria_grid$absolute_threshold,
+  ~ count_shocks(.x, .y, vaccination_descriptive)
+)
+
+# View results
+shock_counts
+print(shock_counts,n=30)
+
+# Function to return detailed shocks (all country-years meeting criteria)
+get_shock_years <- function(growth_threshold, absolute_threshold, df) {
+  df_shocks <- df %>%
+    group_by(Country.Code, vaccine) %>%
+    arrange(Year) %>%
+    mutate(
+      lag_total = lag(Total),
+      displacement_growth = if_else(lag_total > 0,
+                                    (Total - lag_total) / lag_total,
+                                    NA_real_),
+      shock = if_else(
+        displacement_growth >= growth_threshold & Total >= absolute_threshold,
+        1, 0
+      )
+    ) %>%
+    ungroup() %>%
+    filter(shock == 1) %>%
+    mutate(
+      growth_threshold = growth_threshold,
+      absolute_threshold = absolute_threshold
+    )
+  
+  return(df_shocks %>%
+           select(Country, Country.Code, Year, conflict_cat, vaccine,
+                  Total, displacement_growth, growth_threshold, absolute_threshold))
+}
+
+# Apply across all threshold combinations
+shock_years_detailed <- map2_dfr(
+  criteria_grid$growth_threshold,
+  criteria_grid$absolute_threshold,
+  ~ get_shock_years(.x, .y, vaccination_descriptive)
+)
+
+# Now you have the FULL list of shocks by country-year, per threshold
+head(shock_years_detailed, 20)
+
+shock_counts_by_country <- shock_years_detailed %>%
+  group_by(Country, conflict_cat, growth_threshold, absolute_threshold) %>%
+  summarise(
+    n_shock_years = n(),
+    shock_years = paste(sort(unique(Year)), collapse = ", "),
+    .groups = "drop"
+  )
+
+head(shock_counts_by_country)
+
+table(shock_counts_by_country$Country[which(shock_counts_by_country$absolute_threshold>=500000)])
+
+# ### Difference-in-difference using "displacement shocks"
+# #create displaced person shock value
+# vaccine_long_shocks <- vaccine_long_merged %>%
+#   group_by(Country.Code, vaccine) %>%
+#   arrange(Year) %>%
+#   mutate(
+#     lag_total = lag(Total),
+#     displacement_growth = (Total - lag_total) / lag_total,
+#     shock = if_else(
+#       displacement_growth >= 0.5 & Total >= 100000,  # both conditions
+#       1,
+#       0
+#     )
+#   ) %>%
+#   ungroup()
+# 
+# # Some countries may never get a shock — allow that!
+# shock_years <- vaccine_long_shocks %>%
+#   filter(shock == 1) %>%
+#   group_by(Country.Code) %>%
+#   summarize(first_shock_year = min(Year), .groups = "drop")
+# 
+# # Left join — this keeps never-treated countries with NA
+# vaccine_long_shocks <- vaccine_long_merged %>%
+#   left_join(shock_years, by = "Country.Code") %>%
+#   group_by(Country.Code, vaccine) %>%
+#   arrange(Year) %>%
+#   mutate(
+#     treat = if_else(!is.na(first_shock_year), 1, 0),
+#     post = if_else(Year >= first_shock_year & treat == 1, 1, 0),
+#     treatment_status = if_else(treat == 1 & post == 1, 1, 0)
+#   ) %>%
+#   ungroup()
+# 
+# vaccine_long_shocks <- vaccine_long_shocks %>%
+#   group_by(Country.Code) %>%
+#   arrange(Year) %>%
+#   mutate(
+#     GDP_per_capita_lag = lag(GDP_per_capita, n = 1)
+#   ) %>%
+#   ungroup()
+# 
+# 
+# 
+# 
+# did_model1 <- feols(
+#   Coverage ~ treatment_status + GDP_per_capita_lag | vaccine + Year,
+#   data = vaccine_long_shocks,
+#   cluster = ~Country.Code
+# )
+# 
+# summary(did_model1)
+# 
+# # did_model <- feols(
+# #   Coverage ~ treatment_status | vaccine + Year,
+# #   data = vaccine_long_shocks
+# # )
+# # summary(did_model)
+# 
+# vaccine_long_shocks1 <- vaccine_long_shocks %>%
+#   mutate(
+#     event_time = Year - first_shock_year
+#   )
+# 
+# vaccine_long_shocks1 <- vaccine_long_shocks1 %>%
+#   mutate(
+#     event_time_factor = factor(event_time)
+#   )
+# 
+# vaccine_long_shocks1 <- vaccine_long_shocks1 %>%
+#   filter(event_time >= -5 & event_time <= 5) %>%
+#   mutate(event_time_factor = factor(event_time_factor))  # refactor to drop unused levels
+# 
+# event_study_model <- feols(
+#   Coverage ~ i(event_time_factor, ref = "-1") + GDP_per_capita | vaccine + Year,
+#   data = vaccine_long_shocks1,
+#   cluster = ~Country.Code
+# )
+# summary(event_study_model)
+
+
+
+
+library(dplyr)
+library(fixest)
+library(broom)
+
+#=========================
+# Function to prepare data and estimate DiD
+#=========================
+run_did_analysis <- function(df, growth_threshold = 0.5, absolute_threshold = 100000) {
+  # Step 1: Identify shocks
+  df <- df %>%
+    group_by(Country.Code, vaccine) %>%
+    arrange(Year) %>%
+    mutate(
+      lag_total = lag(Total),
+      displacement_growth = if_else(lag_total > 0, (Total - lag_total) / lag_total, NA_real_),
+      shock = if_else(
+        displacement_growth >= growth_threshold & Total >= absolute_threshold,
+        1,
+        0
+      )
+    ) %>%
+    ungroup()
+  
+  # Step 2: First shock year per country
+  shock_years <- df %>%
+    filter(shock == 1) %>%
+    group_by(Country.Code) %>%
+    summarize(first_shock_year = min(Year), .groups = "drop")
+  
+  
+  # Step 3: Merge and create treatment indicators
+  # df <- df %>% #all post years
+  #   left_join(shock_years, by = "Country.Code") %>%
+  #   group_by(Country.Code, vaccine) %>%
+  #   arrange(Year) %>%
+  #   mutate(
+  #     treat = if_else(!is.na(first_shock_year), 1, 0),
+  #     post = if_else(Year >= first_shock_year & treat == 1, 1, 0),
+  #     treatment_status = if_else(treat == 1 & post == 1, 1, 0),
+  #     GDP_per_capita_lag = lag(GDP_per_capita)
+  #   ) %>%
+  #   ungroup()
+  
+  df <- df %>% #first year only
+    left_join(shock_years, by = "Country.Code") %>%
+    group_by(Country.Code, vaccine) %>%
+    arrange(Year) %>%
+    mutate(
+      treat = if_else(!is.na(first_shock_year), 1, 0),
+      # post is now only TRUE in the first shock year
+      post = if_else(Year == first_shock_year & treat == 1, 1, 0),
+      # treatment_status is 1 only for first post-shock year
+      treatment_status = if_else(treat == 1 & post == 1, 1, 0),
+      GDP_per_capita_lag = lag(GDP_per_capita)
+    ) %>%
+    ungroup()
+
+  # df <- df %>% # first THREE years
+  #   left_join(shock_years, by = "Country.Code") %>%
+  #   group_by(Country.Code, vaccine) %>%
+  #   arrange(Year) %>%
+  #   mutate(
+  #     treat = if_else(!is.na(first_shock_year), 1, 0),
+  #     # TRUE for the first three years after shock (shock year, shock year+1, shock year+2)
+  #     post = if_else(
+  #       Year >= first_shock_year & Year <= first_shock_year + 2 & treat == 1,
+  #       1, 0
+  #     ),
+  #     # treatment_status is also 1 for exactly those three years
+  #     treatment_status = post,
+  #     GDP_per_capita_lag = lag(GDP_per_capita)
+  #   ) %>%
+  #   ungroup()
+  
+  
+  # Step 3b: Create conflict intensity category
+  df <- df %>%
+    mutate(
+      conflict_cat = case_when(
+        is.na(intensity_level) ~ "None",
+        intensity_level == 1 ~ "Low-level",
+        intensity_level >= 2 ~ "War"
+      ),
+      conflict_cat = factor(conflict_cat, levels = c("None", "Low-level", "War"))
+    )
+  
+  # Step 4: Run DiD model (with conflict category)
+  # did_model <- feols(
+  #   Coverage ~ treatment_status + GDP_per_capita_lag + conflict_cat | vaccine + Year,
+  #   data = df,
+  #   cluster = ~Country.Code
+  # )
+  
+  did_model <- feols(
+    Coverage ~ treatment_status * conflict_cat + log(GDP_per_capita_lag) | vaccine + Year,
+    data = df,
+    cluster = ~Country.Code
+  )
+  
+  # Step 5: Event Study Preparation
+  df_es <- df %>%
+    mutate(event_time = Year - first_shock_year) %>%
+    filter(event_time >= -5, event_time <= 5) %>%
+    mutate(event_time_factor = factor(event_time))
+  
+  # Step 6: Event Study Regression (with conflict category)
+  es_model <- feols(
+    Coverage ~ i(event_time_factor, ref = "-1") + log(GDP_per_capita) + conflict_cat | vaccine + Year,
+    data = df_es,
+    cluster = ~Country.Code
+  )
+  # 
+  # for different war types (delineated):
+  
+  # df_es <- df_es %>%
+  #   mutate(conflict_cat = relevel(conflict_cat, ref = "War"))
+  # 
+  # es_model <- feols(
+  #   Coverage ~ i(event_time, ref = -1) * conflict_cat + GDP_per_capita | vaccine + Year,
+  #   data = df_es,
+  #   cluster = ~Country.Code
+  # )
+  
+  # Step 7: Format outputs
+  did_summary <- broom::tidy(did_model) %>%
+    filter(term == "treatment_status") %>%
+    select(term, estimate, std.error, p.value)
+  
+  es_summary <- broom::tidy(es_model) %>%
+    filter(grepl("event_time_factor::", term)) %>%
+    mutate(event_time = as.numeric(gsub("event_time_factor::", "", term))) %>%
+    select(event_time, estimate, std.error, p.value)
+  
+  # es_summary <- broom::tidy(es_model) %>%
+  #   filter(grepl("event_time::", term)) %>%
+  #   mutate(event_time = as.numeric(gsub("event_time::", "", term))) %>%
+  #   select(term, event_time, estimate, std.error, p.value)
+  
+  return(list(
+    did_model = did_model,
+    event_study_model = es_model,
+    did_summary = did_summary,
+    es_summary = es_summary
+  ))
+}
+
+
+
+results <- run_did_analysis(
+  df = vaccine_long_merged,
+  growth_threshold = 1.0,
+  absolute_threshold = 500000
+)
+
+
+
+# Extract all relevant terms from the DiD model
+did_summary_all <- broom::tidy(results$did_model) %>%
+  filter(term %in% c(
+    "treatment_status", 
+    "conflict_catLow-level", 
+    "conflict_catWar",
+    "treatment_status:conflict_catLow-level",
+    "treatment_status:conflict_catWar"
+  )) %>%
+  mutate(
+    conf.low = estimate - 1.96 * std.error,
+    conf.high = estimate + 1.96 * std.error,
+    formatted = sprintf("%.2f (%.2f, %.2f)", estimate, conf.low, conf.high)
+  )
+
+# Update the stored results
+results$did_summary <- did_summary_all
+
+# View DiD result
+print(results$did_summary, width = Inf)
+
+# View pre-trend check: subset to pre-period only
+results$es_summary %>% 
+  filter(event_time < 0)
+
+
+
+####EVENT STUDY MODEL
+# Extract the event study results -- let's do 50% and 50,000, 150,000, 250,000 and 500,000
+es_df <- results$es_summary
+
+# Plot
+a8 <- ggplot(es_df, aes(x = event_time, y = estimate)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray40") +
+  geom_point(size = 2, color = "#2C3E50") +
+  geom_errorbar(aes(ymin = estimate - 1.96 * std.error,
+                    ymax = estimate + 1.96 * std.error),
+                width = 0.2, color = "#2C3E50") +
+  scale_x_continuous(breaks = seq(min(es_df$event_time), max(es_df$event_time), 1)) +
+  labs(
+    x = "Years relative to displacement shock",
+    y = "Effect on vaccination coverage (pp)",
+    subtitle = "C. Event Study: 100% Threshold, 500,000 population"
+  ) +
+  theme_minimal(base_size = 14)
+
+multiplot(a5,a7,a6,a8,cols=2)
+
+
+##### EVENT STUDY BY CONFLICT TYPE
+# First, pull the es_summary
+es_df <- results$es_summary
+
+# Extract effects for baseline ('None')
+base_effects <- es_df %>%
+  filter(grepl("^event_time::", term)) %>%
+  mutate(conflict_cat = "None")
+
+# Extract interactions for Low-level and War
+interaction_effects <- es_df %>%
+  filter(grepl("conflict_cat", term)) %>%
+  mutate(
+    conflict_cat = case_when(
+      grepl("conflict_catLow-level", term) ~ "Low-level",
+      grepl("conflict_catWar", term) ~ "War"
+    ),
+    event_time = as.numeric(str_extract(term, "(?<=::)-?\\d+"))
+  )
+
+# Merge and compute total effects
+combined_effects <- interaction_effects %>%
+  left_join(base_effects %>% select(event_time, base_estimate = estimate), by = "event_time") %>%
+  mutate(
+    total_estimate = base_estimate + estimate,
+    conf.low = total_estimate - 1.96 * std.error,
+    conf.high = total_estimate + 1.96 * std.error
+  )
+
+# Now bind together all effects (base + interactions)
+final_event_study <- base_effects %>%
+  select(event_time, estimate, std.error, p.value, conflict_cat) %>%
+  mutate(
+    conf.low = estimate - 1.96 * std.error,
+    conf.high = estimate + 1.96 * std.error
+  ) %>%
+  bind_rows(
+    combined_effects %>%
+      select(event_time, estimate = total_estimate, std.error, p.value, conflict_cat, conf.low, conf.high)
+  )
+
+# Define small offsets for each conflict category
+jitter_width <- 0.20
+
+final_event_study <- final_event_study %>%
+  mutate(
+    event_time_jitter = case_when(
+      conflict_cat == "None"      ~ event_time - jitter_width,
+      conflict_cat == "Low-level" ~ event_time,
+      conflict_cat == "War"       ~ event_time + jitter_width,
+      TRUE                       ~ event_time
+    )
+  )
+
+ggplot(final_event_study, aes(x = event_time_jitter, y = estimate, color = conflict_cat)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_point(position = position_identity()) +  # no extra jitter here because we pre-shifted x
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.2, position = position_identity()) +
+  scale_x_continuous(breaks = unique(final_event_study$event_time), labels = unique(final_event_study$event_time)) +
+  labs(
+    title = "Event Study: Displacement Shock Impact on Vaccination Coverage",
+    y = "Effect on coverage (pp)",
+    x = "Years relative to shock",
+    color = "Conflict intensity"
+  ) +
+  theme_minimal()
+
+
+###DID ESTIMATE PLOTS
+# 1. Set range of thresholds
+thresholds <- seq(0, 1500000, by = 50000)
+
+# 2. Store results
+did_results <- list()
+
+# 3. Loop over thresholds
+for (threshold in thresholds) {
+  result <- run_did_analysis(
+    df = vaccine_long_merged,
+    growth_threshold = 1.0,
+    absolute_threshold = threshold
+  )
+  
+  # Extract and format DiD estimate
+  formatted <- result$did_summary %>%
+    mutate(
+      absolute_threshold = threshold,
+      conf.low = estimate - 1.96 * std.error,
+      conf.high = estimate + 1.96 * std.error
+    )
+  
+  did_results[[as.character(threshold)]] <- formatted
+}
+
+# 4. Combine into one data frame
+# b.25 <- bind_rows(did_results)
+# b.50 <- bind_rows(did_results)
+# b.75 <- bind_rows(did_results)
+b1.0 <- bind_rows(did_results)
+
+did_plot_df <- bind_rows(did_results)
+
+# 5. Plot the estimates with ggplot
+a4 <- ggplot(did_plot_df, aes(x = absolute_threshold, y = estimate)) +
+  geom_point() +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 25000) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray40") +
+  labs(
+    subtitle = "D. DiD Estimates at the 100% Increase Scenario",
+    x = "Absolute Displacement Threshold",
+    y = "DiD Estimate (Coverage)"#,
+    # caption = "With 95% Confidence Intervals"
+  ) +
+  theme_minimal()
+
+multiplot(a1,a3,a2,a4,cols=2)
+
+
+
+## add table 
+# Add a new column to each tibble indicating the increase threshold
+b.25 <- b.25 %>% mutate(increase_threshold = "25%")
+b.50 <- b.50 %>% mutate(increase_threshold = "50%")
+b.75 <- b.75 %>% mutate(increase_threshold = "75%")
+b1.0 <- b1.0 %>% mutate(increase_threshold = "100%")
+
+# Combine all tibbles into one
+combined_b <- bind_rows(b.25, b.50, b.75, b1.0)
+
+library(dplyr)
+library(tidyr)
+library(stringr)
+
+# Format estimate with 95% CI
+formatted_table <- combined_b %>%
+  filter(absolute_threshold %in% c(0, 100000, 200000, 300000)) %>%  # show only key thresholds
+  mutate(
+    Estimate_CI = sprintf("%.2f (%.2f, %.2f)", estimate, conf.low, conf.high),
+    Threshold = scales::comma(absolute_threshold)
+  ) %>%
+  select(
+    `Displacement Increase Threshold` = increase_threshold,
+    `Absolute Threshold` = Threshold,
+    `Estimate (95% CI)` = Estimate_CI,
+    `p-value` = p.value
+  ) %>%
+  arrange(`Displacement Increase Threshold`, `Absolute Threshold`)
+
+
+
+
+
+#### PLACEBO ANALYSIS
+run_did_analysis <- function(df, growth_threshold = 0.5, absolute_threshold = 100000,
+                             placebo_year_shift = NULL) {
+  # Step 1: Identify shocks
+  df <- df %>%
+    group_by(Country.Code, vaccine) %>%
+    arrange(Year) %>%
+    mutate(
+      lag_total = lag(Total),
+      displacement_growth = if_else(lag_total > 0, (Total - lag_total) / lag_total, NA_real_),
+      shock = if_else(
+        displacement_growth >= growth_threshold & Total >= absolute_threshold,
+        1, 0
+      )
+    ) %>%
+    ungroup()
+  
+  # Step 2: First shock year per country
+  shock_years <- df %>%
+    filter(shock == 1) %>%
+    group_by(Country.Code) %>%
+    summarize(first_shock_year = min(Year), .groups = "drop")
+  
+  # --- NEW: Placebo adjustment ---
+  if (!is.null(placebo_year_shift)) {
+    shock_years <- shock_years %>%
+      mutate(first_shock_year = first_shock_year + placebo_year_shift)
+  }
+  
+  # Step 3: Merge and create treatment indicators
+  df <- df %>%
+    left_join(shock_years, by = "Country.Code") %>%
+    group_by(Country.Code, vaccine) %>%
+    arrange(Year) %>%
+    mutate(
+      treat = if_else(!is.na(first_shock_year), 1, 0),
+      # Define treatment period (here: 3 years post shock)
+      post = if_else(
+        Year >= first_shock_year & Year <= first_shock_year + 2 & treat == 1,
+        1, 0
+      ),
+      treatment_status = post,
+      GDP_per_capita_lag = lag(GDP_per_capita)
+    ) %>%
+    ungroup()
+  
+  # Step 3b: Conflict categories
+  df <- df %>%
+    mutate(
+      conflict_cat = case_when(
+        is.na(intensity_level) ~ "None",
+        intensity_level == 1 ~ "Low-level",
+        intensity_level >= 2 ~ "War"
+      ),
+      conflict_cat = factor(conflict_cat, levels = c("None", "Low-level", "War"))
+    )
+  
+  # Step 4: Run DiD model
+  did_model <- feols(
+    Coverage ~ treatment_status * conflict_cat + log(GDP_per_capita_lag) | vaccine + Year,
+    data = df,
+    cluster = ~Country.Code
+  )
+  
+  # Step 5: Event Study
+  df_es <- df %>%
+    mutate(event_time = Year - first_shock_year) %>%
+    filter(event_time >= -5, event_time <= 5) %>%
+    mutate(event_time_factor = factor(event_time))
+  
+  es_model <- feols(
+    Coverage ~ i(event_time_factor, ref = "-1") + log(GDP_per_capita_lag) + conflict_cat | vaccine + Year,
+    data = df_es,
+    cluster = ~Country.Code
+  )
+  
+  # Step 6: Summaries
+  did_summary <- broom::tidy(did_model) %>%
+    filter(term == "treatment_status") %>%
+    select(term, estimate, std.error, p.value)
+  
+  es_summary <- broom::tidy(es_model) %>%
+    filter(grepl("event_time_factor::", term)) %>%
+    mutate(event_time = as.numeric(gsub("event_time_factor::", "", term))) %>%
+    select(event_time, estimate, std.error, p.value)
+  
+  return(list(
+    did_model = did_model,
+    event_study_model = es_model,
+    did_summary = did_summary,
+    es_summary = es_summary
+  ))
+}
+
+results_placebo <- run_did_analysis(
+  df = vaccine_long_merged,
+  growth_threshold = 0.5,
+  absolute_threshold = 50000,
+  placebo_year_shift = 3
+)
+
+# Extract all relevant terms from the DiD model
+did_summary_all <- broom::tidy(results_placebo$did_model) %>%
+  filter(term %in% c(
+    "treatment_status", 
+    "conflict_catLow-level", 
+    "conflict_catWar",
+    "treatment_status:conflict_catLow-level",
+    "treatment_status:conflict_catWar"
+  )) %>%
+  mutate(
+    conf.low = estimate - 1.96 * std.error,
+    conf.high = estimate + 1.96 * std.error,
+    formatted = sprintf("%.2f (%.2f, %.2f)", estimate, conf.low, conf.high)
+  )
+
+# Update the stored results
+results$did_summary <- did_summary_all
+
+# View DiD result
+print(results$did_summary, width = Inf)
+
+# View pre-trend check: subset to pre-period only
+results$es_summary %>% 
+  filter(event_time < 0)
+
+
+
+
+library(dplyr)
+library(fixest)
+library(ggplot2)
+
+# Function to run placebo analysis
+run_placebo_analysis <- function(df, n_iter = 500, seed = 1234) {
+  set.seed(seed)
+  
+  placebo_estimates <- numeric(n_iter)
+  
+  for (i in 1:n_iter) {
+    # Assign random placebo shock years within the observed year range per country
+    placebo_years <- df %>%
+      group_by(Country.Code) %>%
+      summarize(placebo_year = sample(unique(Year), 1), .groups = "drop")
+    
+    df_placebo <- df %>%
+      left_join(placebo_years, by = "Country.Code") %>%
+      group_by(Country.Code, vaccine) %>%
+      arrange(Year) %>%
+      mutate(
+        treat = 1,  # force everyone to be "treated"
+        post = if_else(Year == placebo_year, 1, 0),
+        treatment_status = post,
+        GDP_per_capita_lag = lag(log(GDP_per_capita + 1)) # logged GDPpc with +1 guard
+      ) %>%
+      ungroup()
+    
+    # Estimate placebo model
+    placebo_model <- feols(
+      Coverage ~ treatment_status + GDP_per_capita_lag | vaccine + Year,
+      data = df_placebo,
+      cluster = ~Country.Code
+    )
+    
+    # Extract estimate of treatment
+    placebo_estimates[i] <- coef(placebo_model)["treatment_status"]
+  }
+  
+  return(placebo_estimates)
+}
+
+vaccine_long_merged <- vaccine_long_merged %>%
+  mutate(
+    Treatment = if_else(displacement_group == "Highest displacement", 1, 0),
+    # placeholder: define Post properly, for now set NA
+    post = NA
+  )
+
+# Run real model
+real_model <- feols(
+  Coverage ~ treatment_status + log(GDP_per_capita + 1) | vaccine + Year,
+  data = vaccine_long_merged,
+  cluster = ~Country.Code
+)
+
+real_estimate <- coef(real_model)["treatment_status"]
+
+# Run placebo test
+placebo_dist <- run_placebo_analysis(vaccine_long_merged, n_iter = 500)
+
+# Summarize
+summary(placebo_dist)
+
+# Visualization
+ggplot(data.frame(estimate = placebo_dist), aes(x = estimate)) +
+  geom_histogram(bins = 40, fill = "gray70", color = "black") +
+  geom_vline(xintercept = real_estimate, color = "red", size = 1.2) +
+  labs(
+    title = "Placebo Distribution of DID Estimates",
+    subtitle = "Red line = true estimated treatment effect",
+    x = "Placebo ATT estimates",
+    y = "Frequency"
+  )
+
+
+
+##### FIGURE 2 #####
+library(tidyverse)
+
+# Example of reshaping Table 3 into long format
+table3 <- tribble(
+  ~Displacement, ~Threshold, ~Effect, ~Estimate, ~Lower, ~Upper,
+  # 50,000+ displaced
+  "50,000+", "50% increase", "Adjusted treatment effect", -3.30, -7.23, 0.62,
+  "50,000+", "50% increase", "Conflict: low intensity", -1.47, -5.20, 2.25,
+  "50,000+", "50% increase", "Conflict: high intensity", -17.44, -23.59, -11.29,
+  "50,000+", "50% increase", "Treatment × low conflict", -5.46, -12.33, 1.41,
+  "50,000+", "50% increase", "Treatment × high conflict", 3.42, -7.58, 14.42,
+  
+  "50,000+", "75% increase", "Adjusted treatment effect", -4.01, -8.14, 0.11,
+  "50,000+", "75% increase", "Conflict: low intensity", -1.48, -5.20, 2.24,
+  "50,000+", "75% increase", "Conflict: high intensity", -17.29, -23.50, -11.08,
+  "50,000+", "75% increase", "Treatment × low conflict", -4.76, -11.74, 2.22,
+  "50,000+", "75% increase", "Treatment × high conflict", -0.60, -9.83, 8.64,
+  
+  "50,000+", "100% increase", "Adjusted treatment effect", -4.81, -9.07, -0.56,
+  "50,000+", "100% increase", "Conflict: low intensity", -1.49, -5.21, 2.23,
+  "50,000+", "100% increase", "Conflict: high intensity", -17.30, -23.51, -11.09,
+  "50,000+", "100% increase", "Treatment × low conflict", -3.97, -11.04, 3.10,
+  "50,000+", "100% increase", "Treatment × high conflict", 0.21, -9.09, 9.50,
+  
+  # 250,000+
+  "250,000+", "50% increase", "Adjusted treatment effect", -5.26, -10.91, 0.38,
+  "250,000+", "50% increase", "Conflict: low intensity", -1.49, -5.19, 2.21,
+  "250,000+", "50% increase", "Conflict: high intensity", -17.08, -23.29, -10.87,
+  "250,000+", "50% increase", "Treatment × low conflict", 0.36, -11.99, 12.71,
+  "250,000+", "50% increase", "Treatment × high conflict", -0.43, -13.57, 12.71,
+  
+  "250,000+", "75% increase", "Adjusted treatment effect", -5.77, -12.03, 0.49,
+  "250,000+", "75% increase", "Conflict: low intensity", -1.44, -5.14, 2.26,
+  "250,000+", "75% increase", "Conflict: high intensity", -16.93, -23.19, -10.66,
+  "250,000+", "75% increase", "Treatment × low conflict", -5.99, -14.68, 2.70,
+  "250,000+", "75% increase", "Treatment × high conflict", -5.35, -18.27, 7.56,
+  
+  "250,000+", "100% increase", "Adjusted treatment effect", -8.13, -15.05, -1.20,
+  "250,000+", "100% increase", "Conflict: low intensity", -1.45, -5.15, 2.25,
+  "250,000+", "100% increase", "Conflict: high intensity", -16.94, -23.20, -10.68,
+  "250,000+", "100% increase", "Treatment × low conflict", -3.63, -12.93, 5.67,
+  "250,000+", "100% increase", "Treatment × high conflict", -2.99, -16.32, 10.34,
+  
+  # 500,000+ (for completeness)
+  "500,000+", "50% increase", "Adjusted treatment effect", -9.36, -17.61, -1.11,
+  "500,000+", "50% increase", "Conflict: low intensity", -1.54, -5.25, 2.17,
+  "500,000+", "50% increase", "Conflict: high intensity", -17.00, -23.26, -10.74,
+  "500,000+", "50% increase", "Treatment × low conflict", 1.89, -7.98, 11.77,
+  "500,000+", "50% increase", "Treatment × high conflict", 3.31, -10.05, 16.67,
+  
+  "500,000+", "75% increase", "Adjusted treatment effect", -11.51, -20.56, -2.46,
+  "500,000+", "75% increase", "Conflict: low intensity", -1.55, -5.26, 2.17,
+  "500,000+", "75% increase", "Conflict: high intensity", -16.85, -23.16, -10.54,
+  "500,000+", "75% increase", "Treatment × low conflict", 4.04, -6.41, 14.49,
+  "500,000+", "75% increase", "Treatment × high conflict", 1.07, -12.53, 14.66,
+  
+  "500,000+", "100% increase", "Adjusted treatment effect", -13.34, -22.67, -4.02,
+  "500,000+", "100% increase", "Conflict: low intensity", -1.55, -5.26, 2.16,
+  "500,000+", "100% increase", "Conflict: high intensity", -16.86, -23.17, -10.55,
+  "500,000+", "100% increase", "Treatment × low conflict", 5.85, -4.78, 16.47,
+  "500,000+", "100% increase", "Treatment × high conflict", 2.89, -10.91, 16.70
+)
+
+# Ensure Threshold is ordered correctly
+table3 <- table3 %>%
+  mutate(Threshold = factor(Threshold, levels = c("50% increase", "75% increase", "100% increase")))
+
+# Ensure Displacement is an ordered factor for correct horizontal facet order
+table3 <- table3 %>%
+  mutate(Displacement = factor(Displacement, levels = c("50,000+", "250,000+", "500,000+")))
+
+# Add a helper column to identify ATE
+table3 <- table3 %>%
+  mutate(Highlight = ifelse(Effect == "Adjusted treatment effect", "ATE", "Other"))
+
+ggplot(table3, aes(x = Threshold, y = Estimate, color = Effect, group = Effect)) +
+  
+  # Horizontal reference line at 0
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  
+  # Points and error bars with alpha for non-ATE
+  geom_point(aes(alpha = Highlight), size = 3, position = position_dodge(width = 0.6)) +
+  geom_errorbar(aes(ymin = Lower, ymax = Upper, alpha = Highlight),
+                width = 0.2, position = position_dodge(width = 0.6)) +
+  
+  # Facet horizontally
+  facet_wrap(~Displacement, nrow = 1, scales = "free_y") +
+  
+  # Scale alpha: ATE fully opaque, others semi-transparent
+  scale_alpha_manual(values = c("ATE" = 1, "Other" = 0.3), guide = "none") +
+  
+  # Fix y-axis limits
+  scale_y_continuous(limits = c(-25, 15)) +
+  
+  # Labels
+  labs(
+    x = "Displacement Threshold",
+    y = "Estimated Effect on Vaccination Coverage (%)",
+    color = "Effect Type"
+    # title = "Impact of Displacement and Conflict on Vaccination Coverage"
+  ) +
+  
+  # Theme tweaks
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "bottom",
+    strip.text = element_text(face = "bold"),
+    panel.spacing.x = unit(1, "lines")
+  )
+
+
+
+#### replicate for Years 1-3
+table4 <- tribble(
+  ~Displacement, ~Threshold, ~Effect, ~Estimate, ~Lower, ~Upper, ~Parallel_trend,
+  # 50,000+ displaced
+  "50,000+", "50% increase", "Adjusted treatment effect", -3.06, -6.67, 0.55, "Yes",
+  "50,000+", "50% increase", "Conflict: low intensity", -1.02, -4.66, 2.62, "Yes",
+  "50,000+", "50% increase", "Conflict: high intensity", -17.34, -23.69, -10.98, "Yes",
+  "50,000+", "50% increase", "Treatment × low conflict", -8.61, -16.86, -0.36, "Yes",
+  "50,000+", "50% increase", "Treatment × high conflict", 1.35, -7.90, 10.59, "Yes",
+  
+  "50,000+", "75% increase", "Adjusted treatment effect", -3.00, -6.69, 0.69, "Yes",
+  "50,000+", "75% increase", "Conflict: low intensity", -1.03, -4.64, 2.58, "Yes",
+  "50,000+", "75% increase", "Conflict: high intensity", -16.91, -23.41, -10.40, "Yes",
+  "50,000+", "75% increase", "Treatment × low conflict", -9.29, -17.94, -0.65, "Yes",
+  "50,000+", "75% increase", "Treatment × high conflict", -3.52, -10.57, 3.52, "Yes",
+  
+  "50,000+", "100% increase", "Adjusted treatment effect", -3.76, -7.58, 0.06, "Yes",
+  "50,000+", "100% increase", "Conflict: low intensity", -1.05, -4.66, 2.56, "Yes",
+  "50,000+", "100% increase", "Conflict: high intensity", -16.94, -23.45, -10.42, "Yes",
+  "50,000+", "100% increase", "Treatment × low conflict", -8.54, -17.21, 0.13, "Yes",
+  "50,000+", "100% increase", "Treatment × high conflict", -2.76, -9.86, 4.34, "Yes",
+  
+  # 250,000+ displaced
+  "250,000+", "50% increase", "Adjusted treatment effect", -4.55, -9.59, 0.50, "Yes",
+  "250,000+", "50% increase", "Conflict: low intensity", -0.94, -4.47, 2.58, "Yes",
+  "250,000+", "50% increase", "Conflict: high intensity", -16.71, -23.31, -10.11, "Yes",
+  "250,000+", "50% increase", "Treatment × low conflict", -7.98, -17.87, 1.91, "Yes",
+  "250,000+", "50% increase", "Treatment × high conflict", -0.82, -11.62, 9.99, "Yes",
+  
+  "250,000+", "75% increase", "Adjusted treatment effect", -4.98, -10.66, 0.71, "Yes",
+  "250,000+", "75% increase", "Conflict: low intensity", -0.87, -4.39, 2.66, "Yes",
+  "250,000+", "75% increase", "Conflict: high intensity", -16.28, -23.02, -9.54, "Yes",
+  "250,000+", "75% increase", "Treatment × low conflict", -11.31, -22.04, -0.58, "Yes",
+  "250,000+", "75% increase", "Treatment × high conflict", -4.72, -15.34, 5.91, "Yes",
+  
+  "250,000+", "100% increase", "Adjusted treatment effect", -6.25, -12.51, 0.00, "Yes",
+  "250,000+", "100% increase", "Conflict: low intensity", -0.88, -4.40, 2.64, "Yes",
+  "250,000+", "100% increase", "Conflict: high intensity", -16.30, -23.05, -9.56, "Yes",
+  "250,000+", "100% increase", "Treatment × low conflict", -10.04, -20.95, 0.87, "Yes",
+  "250,000+", "100% increase", "Treatment × high conflict", -3.43, -14.41, 7.56, "Yes",
+  
+  # 500,000+ displaced
+  "500,000+", "50% increase", "Adjusted treatment effect", -8.25, -15.57, -0.93, "Yes",
+  "500,000+", "50% increase", "Conflict: low intensity", -1.10, -4.70, 2.50, "Yes",
+  "500,000+", "50% increase", "Conflict: high intensity", -16.46, -23.20, -9.72, "Yes",
+  "500,000+", "50% increase", "Treatment × low conflict", -10.76, -27.23, 5.70, "Yes",
+  "500,000+", "50% increase", "Treatment × high conflict", 2.10, -9.19, 13.40, "Yes",
+  
+  "500,000+", "75% increase", "Adjusted treatment effect", -10.16, -18.38, -1.94, "Yes",
+  "500,000+", "75% increase", "Conflict: low intensity", -1.08, -4.67, 2.50, "Yes",
+  "500,000+", "75% increase", "Conflict: high intensity", -16.04, -22.92, -9.17, "Yes",
+  "500,000+", "75% increase", "Treatment × low conflict", -12.82, -30.97, 5.33, "Yes",
+  "500,000+", "75% increase", "Treatment × high conflict", 0.24, -11.43, 11.92, "Yes",
+  
+  "500,000+", "100% increase", "Adjusted treatment effect", -10.79, -19.26, -2.33, "Yes",
+  "500,000+", "100% increase", "Conflict: low intensity", -1.09, -4.67, 2.50, "Yes",
+  "500,000+", "100% increase", "Conflict: high intensity", -16.05, -22.93, -9.18, "Yes",
+  "500,000+", "100% increase", "Treatment × low conflict", -12.19, -30.43, 6.05, "Yes",
+  "500,000+", "100% increase", "Treatment × high conflict", 0.88, -10.98, 12.73, "Yes"
+)
+
+
+# Ensure Threshold is ordered correctly
+table4 <- table4 %>%
+  mutate(Threshold = factor(Threshold, levels = c("50% increase", "75% increase", "100% increase")))
+
+# Ensure Displacement is an ordered factor for correct horizontal facet order
+table4 <- table4 %>%
+  mutate(Displacement = factor(Displacement, levels = c("50,000+", "250,000+", "500,000+")))
+
+# Add a helper column to identify ATE
+table4 <- table4 %>%
+  mutate(Highlight = ifelse(Effect == "Adjusted treatment effect", "ATE", "Other"))
+
+
+ggplot(table4, aes(x = Threshold, y = Estimate, color = Effect, group = Effect)) +
+  
+  # Horizontal reference line at 0
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  
+  # Points and error bars with alpha for non-ATE
+  geom_point(aes(alpha = Highlight), size = 3, position = position_dodge(width = 0.6)) +
+  geom_errorbar(aes(ymin = Lower, ymax = Upper, alpha = Highlight),
+                width = 0.2, position = position_dodge(width = 0.6)) +
+  
+  # Facet horizontally
+  facet_wrap(~Displacement, nrow = 1, scales = "free_y") +
+  
+  # Scale alpha: ATE fully opaque, others semi-transparent
+  scale_alpha_manual(values = c("ATE" = 1, "Other" = 0.3), guide = "none") +
+  
+  # Fix y-axis limits
+  scale_y_continuous(limits = c(-25, 15)) +
+  
+  # Labels
+  labs(
+    x = "Displacement Threshold",
+    y = "Estimated Effect on Vaccination Coverage (%)",
+    color = "Effect Type"
+    # title = "Impact of Displacement and Conflict on Vaccination Coverage"
+  ) +
+  
+  # Theme tweaks
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "bottom",
+    strip.text = element_text(face = "bold"),
+    panel.spacing.x = unit(1, "lines")
+  )
+
+
+###############
+#### second part of figure 2
+
+results <- run_did_analysis(
+  df = vaccine_long_merged,
+  growth_threshold = 0.5,
+  absolute_threshold = 250000
+)
+
+# Extract all relevant terms from the DiD model
+did_summary_all <- broom::tidy(results$did_model) %>%
+  filter(term %in% c(
+    "treatment_status", 
+    "conflict_catLow-level", 
+    "conflict_catWar",
+    "treatment_status:conflict_catLow-level",
+    "treatment_status:conflict_catWar"
+  )) %>%
+  mutate(
+    conf.low = estimate - 1.96 * std.error,
+    conf.high = estimate + 1.96 * std.error,
+    formatted = sprintf("%.2f (%.2f, %.2f)", estimate, conf.low, conf.high)
+  )
+
+# Update the stored results
+results$did_summary <- did_summary_all
+
+# View DiD result
+print(results$did_summary, width = Inf)
+
+# View pre-trend check: subset to pre-period only
+results$es_summary %>% 
+  filter(event_time < 0)
+
+
+es_df <- results$es_summary
+
+# Subset CI ribbon to post-shock only
+es_df_post <- es_df %>% filter(event_time >= 0)
+
+ggplot() +
+  # Confidence ribbon (only post-event)
+  geom_ribbon(data = es_df_post,
+              aes(x = event_time,
+                  ymin = estimate - 1.96 * std.error,
+                  ymax = estimate + 1.96 * std.error),
+              fill = "#2C3E50", alpha = 0.15) +
+  
+  # Zero reference lines
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray40") +
+  geom_vline(xintercept = 0, linetype = "solid", color = "firebrick", size = 0.6) +
+  
+  # Point estimates & error bars (full range, pre and post)
+  geom_point(data = es_df, aes(x = event_time, y = estimate),
+             size = 3, color = "#2C3E50") +
+  geom_errorbar(data = es_df,
+                aes(x = event_time,
+                    ymin = estimate - 1.96 * std.error,
+                    ymax = estimate + 1.96 * std.error),
+                width = 0.15, color = "#2C3E50") +
+  
+  # Axis breaks
+  scale_x_continuous(breaks = seq(min(es_df$event_time), max(es_df$event_time), 1)) +
+  scale_y_continuous(limits = c(-12,8)) +
+  
+  # Labels
+  labs(
+    x = "Years relative to displacement shock",
+    y = "Effect on vaccination coverage (pp)",
+    subtitle = "50% Threshold, 250,000 population"
+  ) +
+  
+  theme_minimal(base_size = 16) +
+  theme(
+    axis.line = element_line(color = "black"),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    plot.subtitle = element_text(face = "bold", hjust = 0.5),
+    strip.text = element_text(face = "bold")
+  )
+
+
+
+#########################
+####### FIGURE 1 ########
+#########################
+
+library(tibble)
+
+
+# Reshape to wide format: vaccines as columns
+vacc_wide <- vaccination_descriptive %>%
+  select(Country, Year, vaccine, Coverage) %>%
+  pivot_wider(names_from = vaccine, values_from = Coverage)
+
+# Base R Spearman correlation
+cor_matrix <- cor(
+  vacc_wide %>% select(-Country, -Year),
+  use = "pairwise.complete.obs",
+  method = "spearman"
+)
+
+# Convert to long format
+cor_long <- as.data.frame(cor_matrix) %>%
+  rownames_to_column("Vaccine1") %>%
+  pivot_longer(-Vaccine1, names_to = "Vaccine2", values_to = "rho")
+
+# Heatmap
+ggplot(cor_long, aes(x = Vaccine1, y = Vaccine2, fill = rho)) +
+  geom_tile(color = "white", width = 0.95, height = 0.95) +
+  geom_text(aes(label = sprintf("%.2f", rho)), color = "black", size = 3) + # optional annotations
+  scale_fill_gradient2(
+    low = "#B2182B", mid = "white", high = "#2166AC",
+    midpoint = 0, limit = c(-1, 1), space = "Lab",
+    name = "Spearman\nρ"
+  ) +
+  coord_fixed() +  # ensures squares
+  labs(
+    # subtitle = "Spearman correlations across country-year vaccine coverage",
+    x = NULL, y = NULL
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1, face = "bold"),
+    axis.text.y = element_text(face = "bold"),
+    panel.grid = element_blank(),
+    plot.title = element_text(face = "bold", size = 16, hjust = 0.5),
+    plot.subtitle = element_text(size = 12, hjust = 0.5),
+    legend.position = "right",
+    legend.title = element_text(face = "bold")
+  )
+
+
+##### spearman coefficient matrix for other variables
+
+vaccination_full <- vaccination_with_brd
+head(as.data.frame(vaccination_full))
+head(as.data.frame(vaccination_descriptive1))
+
+vaccination_full <- vaccination_full %>%
+  left_join(
+    vaccination_descriptive1 %>%
+      select(Country.Code, Year, Total.Deaths, Total.Affected),
+    by = c("Country.Code", "Year")
+  )
+
+vaccination_countryyear <- vaccination_full %>%
+  group_by(Country.Code, Year) %>%
+  summarise(
+    MeanCoverage  = mean(Coverage, na.rm = TRUE),
+    Total.ND.Deaths   = first(Total.Deaths),
+    Total.ND.Affected = first(Total.Affected),
+    Female.0.4.Displaced = first(Female.0...4),
+    Male.0.4.Displaced = first(Male.0...4),
+    Female.Displaced = first(Female.Total),
+    Male.Displaced = first(Male.Total),
+    Total.Displaced = first(Total),
+    GDP_per_capita = first(GDP_per_capita),
+    Battle.Deaths = first(bd_best),
+    .groups = "drop"
+  )
+
+# Base R Spearman correlation
+cor_matrix <- cor(
+  vaccination_countryyear %>% select(-Country.Code, -Year),
+  use = "pairwise.complete.obs",
+  method = "spearman"
+)
+
+# Convert to long format
+cor_long <- cor_matrix %>%
+  as.data.frame() %>%
+  rownames_to_column("Var1") %>%
+  pivot_longer(
+    cols = -Var1,
+    names_to = "Var2",
+    values_to = "Correlation"
+  ) %>%
+  arrange(Var1, Var2)
+
+# Heatmap of correlations
+ggplot(cor_long, aes(x = Var1, y = Var2, fill = Correlation)) +
+  geom_tile(color = "white", width = 0.95, height = 0.95) +
+  geom_text(aes(label = sprintf("%.2f", Correlation)), 
+            color = "black", size = 3) +  # optional annotations
+  scale_fill_gradient2(
+    low = "#B2182B", mid = "white", high = "#2166AC",
+    midpoint = 0, limit = c(-1, 1), space = "Lab",
+    name = "Spearman\nρ"
+  ) +
+  coord_fixed() +  # ensures squares
+  labs(
+    x = NULL, 
+    y = NULL
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1, face = "bold"),
+    axis.text.y = element_text(face = "bold"),
+    panel.grid = element_blank(),
+    plot.title = element_text(face = "bold", size = 16, hjust = 0.5),
+    plot.subtitle = element_text(size = 12, hjust = 0.5),
+    legend.position = "right",
+    legend.title = element_text(face = "bold")
+  )
+
+
+# bar plots
+head(as.data.frame(vaccination_full))
+
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+
+# # Remove NAs and create quintiles
+# df_quint <- vaccination_full %>%
+#   filter(!is.na(Total), !is.na(bd_best), !is.na(Total.Deaths)) %>%
+#   mutate(
+#     Displacement_quintile = ntile(Total, 5),
+#     BRDs_quintile = ntile(bd_best, 5),
+#     DisasterDeaths_quintile = ntile(Total.Deaths, 5)
+#   ) %>%
+#   pivot_longer(
+#     cols = c(Displacement_quintile, BRDs_quintile, DisasterDeaths_quintile),
+#     names_to = "Variable",
+#     values_to = "Quintile"
+#   )
+# 
+# # Plot grouped boxplots
+# ggplot(df_quint, aes(x = factor(Quintile), y = Coverage, fill = Variable)) +
+#   geom_boxplot(outlier.shape = NA, position = position_dodge(width = 0.8)) +
+#   scale_fill_manual(
+#     values = c("Displacement_quintile" = "#1b9e77",
+#                "BRDs_quintile" = "#d95f02",
+#                "DisasterDeaths_quintile" = "#7570b3"),
+#     labels = c("Displacement", "BRDs", "Disaster Deaths")
+#   ) +
+#   scale_y_continuous(limits = c(25, 100)) +
+#   labs(
+#     x = "Quintile",
+#     y = "Vaccination Coverage (%)",
+#     fill = "Variable"
+#   ) +
+#   theme_minimal(base_size = 14) +
+#   theme(
+#     axis.title.y = element_text(angle = 90, face = "bold"),
+#     axis.text.x = element_text(face = "bold"),
+#     axis.text.y = element_text(face = "bold"),
+#     legend.position = "bottom"
+#   )
+
+
+df_quint_long <- vaccination_full %>%
+  filter(
+    !is.na(Coverage),
+    !is.na(Total),
+    !is.na(bd_best),
+    !is.na(Total.Deaths)
+  ) %>%
+  distinct(Country.Code, Year, vaccine, .keep_all = TRUE) %>%
+  mutate(
+    Displacement_quintile   = ntile(Total, 5),
+    BRDs_quintile           = ntile(bd_best, 5),
+    DisasterDeaths_quintile = ntile(Total.Deaths, 5)
+  ) %>%
+  pivot_longer(
+    cols = ends_with("_quintile"),
+    names_to = "Variable",
+    values_to = "Quintile"
+  )
+
+ggplot(
+  df_quint_long,
+  aes(
+    x = factor(Quintile),
+    y = Coverage,
+    fill = Variable
+  )
+) +
+  geom_boxplot(outlier.shape = NA) +
+  facet_wrap(
+    ~ Variable,
+    labeller = as_labeller(c(
+      Displacement_quintile   = "Displacement",
+      BRDs_quintile           = "Battle-related deaths",
+      DisasterDeaths_quintile = "Disaster deaths"
+    ))
+  ) +
+  scale_fill_manual(
+    values = c(
+      "Displacement_quintile"   = "#1b9e77",
+      "BRDs_quintile"           = "#d95f02",
+      "DisasterDeaths_quintile" = "#7570b3"
+    ),
+    guide = "none"  # legend is redundant with facets
+  ) +
+  scale_y_continuous(limits = c(25, 100)) +
+  labs(
+    x = "Quintile (1 = lowest, 5 = highest)",
+    y = "Vaccination coverage (%)"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    strip.text = element_text(face = "bold"),
+    axis.text  = element_text(face = "bold"),
+    axis.title = element_text(face = "bold")
+  )
+
+
+
+
+##additional background for checks: 
+df_disp <- vaccination_full %>%
+  filter(!is.na(Total), !is.na(Coverage)) %>%
+  distinct(Country.Code, Year, vaccine, .keep_all = TRUE) %>% 
+  mutate(
+    Displacement_quintile = ntile(Total, 5)
+  )
+
+avg_cov_by_disp_quint <- df_disp %>%
+  group_by(Displacement_quintile) %>%
+  summarise(
+    mean_coverage = mean(Coverage, na.rm = TRUE),
+    median_coverage = median(Coverage, na.rm = TRUE),
+    n = n(),
+    .groups = "drop"
+  )
+
+
+
+
+### regression outcomes
+table5 <- tribble(
+  ~Category, ~GDP, ~Group, ~Estimate, ~Lower, ~Upper,
+  # Displacement Quintiles
+  "Displacement Group", "Without", "Low-Mid", -2.21, -3.59, -0.82, 
+  "Displacement Group", "With", "Low-Mid", 0.33, -0.60, 1.26, 
+  "Displacement Group", "Without", "Mid", -1.21, -2.58, 0.17, 
+  "Displacement Group", "With", "Mid", 4.12, 2.97, 5.27, 
+  "Displacement Group", "Without", "High-Mid", -7.52, -9.76, -5.27, 
+  "Displacement Group", "With", "High-Mid", 0.76, -0.28, 1.81, 
+  "Displacement Group", "Without", "High", -10.94, -13.28, -8.60, 
+  "Displacement Group", "With", "High", -1.72, -3.23, -0.22, 
+  
+  # Conflict Intensity
+  "Conflict Intensity", "Without", "Minor", -3.88, -5.21, -2.55,
+  "Conflict Intensity", "With", "Minor", -1.38, -2.29, -0.46,
+  "Conflict Intensity", "Without", "War", -22.71, -25.26, -20.35,
+  "Conflict Intensity", "With", "War", -16.88, -18.58, -15.17,
+  
+  # Natural Disaster Intensity
+  "Natural Disaster Intensity", "Without", "Minor", -2.76, -3.48, -2.02,
+  "Natural Disaster Intensity", "With", "Minor", -1.05, -1.67, -0.43,
+  "Natural Disaster Intensity", "Without", "High", -3.67, -5.71, -1.63,
+  "Natural Disaster Intensity", "With", "High", -2.71, -4.79, -0.63
+)
+
+# Ensure Threshold is ordered correctly
+table5 <- table5 %>%
+  mutate(GDP = factor(GDP, levels = c("With", "Without")))
+
+# Ensure Displacement is an ordered factor for correct horizontal facet order
+table5 <- table5 %>%
+  mutate(Category = factor(Category, levels = c("Displacement Group", "Conflict Intensity", "Natural Disaster Intensity")))
+
+
+# Set factor order by Category
+table5 <- table5 %>%
+  mutate(Group = case_when(
+    Category == "Conflict Intensity" ~ factor(Group, levels = c("Minor", "War")),
+    Category == "Displacement Group" ~ factor(Group, levels = c("Low-Mid", "Mid", "High-Mid", "High")),
+    Category == "Natural Disaster Intensity" ~ factor(Group, levels = c("Minor", "High")),
+    TRUE ~ factor(Group)
+  ))
+
+ggplot(table5, aes(x = Group, y = Estimate, color = GDP, group = GDP)) +
+  # reference line
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  
+  # points + CI
+  geom_point(size = 3, position = position_dodge(width = 0.6)) +
+  geom_errorbar(aes(ymin = Lower, ymax = Upper),
+                width = 0.2, position = position_dodge(width = 0.6)) +
+  
+  # facets by Category
+  facet_wrap(~Category, nrow = 1, scales = "free_x") +
+  
+  # y-axis scaling
+  scale_y_continuous(limits = c(-26, 6)) +
+  
+  # labels
+  labs(
+    x = "Group",
+    y = "Estimated Effect on Vaccination Coverage (%)",
+    color = "GDP"
+  ) +
+  
+  # theme tweaks
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "bottom",
+    strip.text = element_text(face = "bold"),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.spacing.x = unit(1, "lines"),
+    axis.line.x = element_line(color = "black", linewidth = 0.5),
+    axis.line.y = element_line(color = "black", linewidth = 0.5)
+  )
+
+
+
+# ---------- 1. Coverage ----------
+p1 <- vaccination_countryyear %>%
+  group_by(Year) %>%
+  summarise(MeanCoverage = mean(MeanCoverage, na.rm = TRUE)) %>%
+  ggplot(aes(x = Year, y = MeanCoverage)) +
+  geom_line(color = "black", linewidth = 1.2) +
+  scale_y_continuous(limits = c(70, 100), expand = c(0, 0)) +
+  labs(x = "Year", y = "Vaccination (%)") +
+  theme_minimal(base_size = 14) +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    axis.line.x = element_line(color = "black", linewidth = 0.6),
+    axis.line.y = element_line(color = "black", linewidth = 0.6),
+    axis.title.y = element_text(angle = 90, vjust = 0.5),
+    plot.margin = margin(5, 5, 5, 5)
+  )
+
+# ---------- 2. Displacement ----------
+p2 <- vaccination_countryyear %>%
+  group_by(Year) %>%
+  summarise(Displaced = sum(Total.Displaced, na.rm = TRUE)) %>%
+  filter(Year != 2000) %>%
+  ggplot(aes(x = Year, y = Displaced)) +
+  geom_line(color = "black", linewidth = 1.2) +
+  scale_y_continuous(labels = label_number(scale_cut = cut_si(""))) +
+  labs(x = "Year", y = "Displaced") +
+  theme_minimal(base_size = 14) +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    axis.line.x = element_line(color = "black", linewidth = 0.6),
+    axis.line.y = element_line(color = "black", linewidth = 0.6),
+    axis.title.y = element_text(angle = 90, vjust = 0.5),
+    plot.margin = margin(5, 5, 5, 5)
+  )
+
+# ---------- 3. Battle-related deaths ----------
+p3 <- vaccination_countryyear %>%
+  group_by(Year) %>%
+  summarise(Battle.Deaths = sum(Battle.Deaths, na.rm = TRUE)) %>%
+  ggplot(aes(x = Year, y = Battle.Deaths)) +
+  geom_line(color = "black", linewidth = 1.2) +
+  scale_y_continuous(labels = label_number(scale_cut = cut_si(""))) +
+  labs(x = "Year", y = "Conflict") +
+  theme_minimal(base_size = 14) +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    axis.line.x = element_line(color = "black", linewidth = 0.6),
+    axis.line.y = element_line(color = "black", linewidth = 0.6),
+    axis.title.y = element_text(angle = 90, vjust = 0.5),
+    plot.margin = margin(5, 5, 5, 5)
+  )
+
+# ---------- 4. Natural disaster deaths ----------
+p4 <- vaccination_countryyear %>%
+  group_by(Year) %>%
+  summarise(Total.ND.Deaths = sum(Total.ND.Deaths, na.rm = TRUE)) %>%
+  ggplot(aes(x = Year, y = Total.ND.Deaths)) +
+  geom_line(color = "black", linewidth = 1.2) +
+  scale_y_continuous(labels = label_number(scale_cut = cut_si(""))) +
+  labs(x = "Year", y = "Disaster") +
+  theme_minimal(base_size = 14) +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    axis.line.x = element_line(color = "black", linewidth = 0.6),
+    axis.line.y = element_line(color = "black", linewidth = 0.6),
+    axis.title.y = element_text(angle = 90, vjust = 0.5),
+    plot.margin = margin(5, 5, 5, 5)
+  )
+
+# ---------- Combine in one row ----------
+combined_plot <- p1 + p2 + p3 + p4 + plot_layout(ncol = 1)
+
+combined_plot
+
+
+
+### displacement shock graph: 
+
+plot_data <- shock_counts %>%
+  filter(!is.na(conflict_cat)) %>%
+  mutate(
+    growth_threshold = factor(
+      growth_threshold,
+      levels = c(0.5, 0.75, 1.0),
+      labels = c("≥50%", "≥75%", "≥100%")
+    ),
+    absolute_threshold = factor(
+      absolute_threshold,
+      levels = c(50000, 150000, 250000, 500000),
+      labels = c("≥50k", "≥150k", "≥250k", "≥500k")
+    )
+  )
+
+shock_years_detailed %>%
+  mutate(
+    conflict_cat = factor(
+      conflict_cat,
+      levels = c("None", "Low-level", "War")
+    ),
+    growth_threshold = factor(
+      growth_threshold,
+      levels = c(0.5, 0.75, 1.0),
+      labels = c("≥50% growth", "≥75% growth", "≥100% growth")
+    ),
+    absolute_threshold = factor(
+      absolute_threshold,
+      levels = c(50000, 150000, 250000, 500000),
+      labels = c("≥50,000", "≥150,000", "≥250,000", "≥500,000")
+    )
+  ) %>%
+  ggplot(
+    aes(x = Year, fill = conflict_cat)
+  ) +
+  geom_histogram(
+    binwidth = 1,
+    position = "stack",
+    color = "white",
+    linewidth = 0.2
+  ) +
+  facet_grid(
+    growth_threshold ~ absolute_threshold
+  ) +
+  scale_fill_brewer(
+    palette = "Set2",
+    name = "Conflict category"
+  ) +
+  labs(
+    x = "Year",
+    y = "Number of displacement shocks"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    strip.text = element_text(size = 9, face = "bold"),
+    axis.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank(),
+    legend.position = "bottom"
+  )
+
+
+
+# 3, 45, 6 
+
+45/54
+
