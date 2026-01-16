@@ -1,0 +1,938 @@
+
+library(mgcv)       # for GAMs
+library(dplyr)      # for data wrangling
+library(ggplot2)    # for plotting
+library(scales)
+library(patchwork)
+
+
+######### POPULATION DISPLACEMENT ON VACCINATION ######### 
+df <- vaccination_descriptive %>%
+  mutate(
+    log_displacement = log1p(Total),   # log transform because displacement is highly skewed
+    country = factor(Country),
+    year = factor(Year),
+    vaccine = factor(vaccine)
+  )
+
+
+# PULL FROM SHEET 4: merge with population data to create population percentages
+df <- df %>%
+  left_join(wbpop_long %>% select(Country.Code, Year, Population),
+            by = c("Country.Code", "Year"))
+df$Population <- as.numeric(df$Population)
+df$Displacement_Pct <- df$Total/df$Population
+
+# Fit a GAM with smooth term for displacement, country FE, and year FE
+gam_model <- gam(
+  Coverage ~ s(log_displacement, k = 8) + 
+    factor(country) + 
+    factor(year) + 
+    factor(vaccine) + 
+    log(GDP_per_capita + 1),
+  data = df,
+  method = "REML"
+)
+
+summary(gam_model)
+gam.check(gam_model)
+
+
+# Create predicted dose-response curve
+
+# Prediction grid
+new_data <- expand.grid(
+  log_displacement = seq(min(df$log_displacement, na.rm = TRUE),
+                         max(df$log_displacement, na.rm = TRUE),
+                         length.out = 100),
+  GDP_per_capita = median(df$GDP_per_capita, na.rm = TRUE),
+  year = "2020",
+  country = "Afghanistan",
+  vaccine = levels(df$vaccine)
+)
+
+# Predict with SE
+pred <- predict(gam_model, newdata = new_data, se.fit = TRUE)
+new_data$fit <- pred$fit
+new_data$upper <- pred$fit + 1.96 * pred$se.fit
+new_data$lower <- pred$fit - 1.96 * pred$se.fit
+
+pred <- predict(gam_model, newdata = new_data, se.fit = TRUE)
+
+new_data$fit <- pred$fit
+new_data$upper <- pred$fit + 1.96 * pred$se.fit
+new_data$lower <- pred$fit - 1.96 * pred$se.fit
+
+# Plot dose-response
+new_data_displaced <- new_data
+
+ggplot(new_data_displaced, aes(x = exp(log_displacement)-1, y = fit, color = vaccine, fill = vaccine)) +
+  geom_line(linewidth = 1.2) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.05, color = NA) +
+  scale_x_continuous(labels = comma, limits = c(0, 1000000)) +
+  scale_y_continuous(limits = c(40,80)) +
+  labs(
+    x = "Total Displaced Persons",
+    y = "Predicted Vaccination Coverage (%)"
+    # subtitle = "Dose–Response (0–500k displaced)"
+  ) +
+  theme_minimal(base_size = 14)
+
+
+# ggplot(new_data, aes(x = exp(log_displacement)-1, y = fit, color = vaccine, fill = vaccine)) +
+#   geom_line(size = 1.2) +
+#   geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.05, color = NA) +  # semi-transparent CI
+#   labs(
+#     x = "Total Displaced Persons",
+#     y = "Predicted Vaccination Coverage (%)",
+#     subtitle = "B. Dose–Response of Population Displacement on Vaccination Coverage by Vaccine",
+#     color = "Vaccine",
+#     fill = "Vaccine"
+#   ) +
+#   scale_x_continuous(labels = comma) +
+#   scale_y_continuous(limits = c(0, 100)) + # coverage 0–100%
+#   scale_color_brewer(palette = "Set2") +
+#   scale_fill_brewer(palette = "Set2") +
+#   theme_minimal(base_size = 14) +
+#   theme(
+#     legend.position = "bottom",
+#     legend.title = element_text(size = 12),
+#     legend.text = element_text(size = 10),
+#     plot.title = element_text(face = "bold", size = 16, hjust = 0.5)
+#   )
+
+
+## dose response model based on population displacement pct ##
+
+# Fit a GAM with smooth term for displacement, country FE, and year FE
+gam_model <- gam(
+  Coverage ~ s(Displacement_Pct, k = 8) + 
+    factor(country) + 
+    factor(year) + 
+    factor(vaccine) + 
+    log(GDP_per_capita + 1),
+  data = df,
+  method = "REML"
+)
+
+summary(gam_model)
+gam.check(gam_model)
+
+
+# Create predicted dose-response curve
+
+# Prediction grid
+new_data <- expand.grid(
+  Displacement_Pct = seq(min(df$Displacement_Pct, na.rm = TRUE),
+                         max(df$Displacement_Pct, na.rm = TRUE),
+                         length.out = 100),
+  GDP_per_capita = median(df$GDP_per_capita, na.rm = TRUE),
+  year = "2020",
+  country = "Afghanistan",
+  vaccine = levels(df$vaccine)
+)
+
+# Predict with SE
+pred <- predict(gam_model, newdata = new_data, se.fit = TRUE)
+new_data$fit <- pred$fit
+new_data$upper <- pred$fit + 1.96 * pred$se.fit
+new_data$lower <- pred$fit - 1.96 * pred$se.fit
+
+pred <- predict(gam_model, newdata = new_data, se.fit = TRUE)
+
+new_data$fit <- pred$fit
+new_data$upper <- pred$fit + 1.96 * pred$se.fit
+new_data$lower <- pred$fit - 1.96 * pred$se.fit
+
+# Plot dose-response
+new_data_displaced <- new_data
+
+#delineated by vaccine
+ggplot(new_data_displaced, aes(x = Displacement_Pct, y = fit, color = vaccine, fill = vaccine)) +
+  geom_line(linewidth = 1.2) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.05, color = NA) +
+  scale_x_continuous(labels = comma, limits = c(0, .05)) +
+  scale_y_continuous(limits = c(40,80)) +
+  labs(
+    x = "Displaced Persons (%)",
+    y = "Predicted Vaccination Coverage (%)"
+    # subtitle = "Dose–Response (0–500k displaced)"
+  ) +
+  theme_minimal(base_size = 14)
+
+
+
+
+
+######### NATURAL DISASTER ON VACCINATION ######### 
+vaccination_descriptive1 <- vaccination_descriptive
+
+disaster_summary <- disaster_data %>%
+  mutate(Year = Start.Year) %>%              # use Start.Year as the disaster year
+  group_by(Country = ISO, Year) %>%         # group by ISO code + Year
+  summarise(
+    Total.Affected = sum(Total.Affected, na.rm = TRUE),
+    Total.Deaths   = sum(Total.Deaths, na.rm = TRUE)
+  ) %>%
+  ungroup()
+
+vaccination_descriptive1 <- vaccination_descriptive1 %>%
+  left_join(disaster_summary, 
+            by = c("Country.Code" = "Country", "Year" = "Year"))
+
+vaccination_descriptive1 <- vaccination_descriptive1 %>%
+  mutate(
+    Total.Affected = ifelse(is.na(Total.Affected), 0, Total.Affected),
+    Total.Deaths   = ifelse(is.na(Total.Deaths), 0, Total.Deaths)
+  )
+
+
+###begin with total affected persons
+df1 <- vaccination_descriptive1 %>%
+  mutate(
+    log_displacement = log1p(Total.Affected + 1),   # log transform because displacement is highly skewed
+    country = factor(Country),
+    year = factor(Year),
+    vaccine = factor(vaccine)
+  )
+
+# Fit a GAM with smooth term for displacement, country FE, and year FE
+gam_model1 <- gam(
+  Coverage ~ s(log_displacement, k = 8) + 
+    factor(country) + 
+    factor(year) + 
+    factor(vaccine) + 
+    log(GDP_per_capita + 1),
+  data = df1,
+  method = "REML"
+)
+
+summary(gam_model1)
+gam.check(gam_model1)
+
+# Prediction grid
+new_data <- expand.grid(
+  log_displacement = seq(min(df1$log_displacement, na.rm = TRUE),
+                         max(df1$log_displacement, na.rm = TRUE),
+                         length.out = 100),
+  GDP_per_capita = median(df1$GDP_per_capita, na.rm = TRUE),
+  year = "2020",
+  country = "Afghanistan",
+  vaccine = levels(df1$vaccine)
+)
+
+# Predict with SE
+pred <- predict(gam_model1, newdata = new_data, se.fit = TRUE)
+new_data$fit <- pred$fit
+new_data$upper <- pred$fit + 1.96 * pred$se.fit
+new_data$lower <- pred$fit - 1.96 * pred$se.fit
+
+# Plot dose-response
+ggplot(new_data, aes(x = exp(log_displacement)-1, y = fit, color = vaccine, fill = vaccine)) +
+  geom_line(size = 1.2) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.05, color = NA) +
+  scale_x_continuous(labels = comma, limits = c(0, 600000)) +
+  labs(
+    x = "Total Affected Persons from Natural Disaster",
+    y = "Predicted Vaccination Coverage (%)",
+    subtitle = "Dose–Response (0–500k displaced)"
+  ) +
+  theme_minimal(base_size = 14)
+
+
+###next look to total deaths
+df2 <- vaccination_descriptive1 %>%
+  mutate(
+    log_displacement = log1p(Total.Deaths + 1),   # log transform because displacement is highly skewed
+    country = factor(Country),
+    year = factor(Year),
+    vaccine = factor(vaccine)
+  )
+
+# Fit a GAM with smooth term for displacement, country FE, and year FE
+gam_model2 <- gam(
+  Coverage ~ s(log_displacement, k = 8) + 
+    factor(country) + 
+    factor(year) + 
+    factor(vaccine) + 
+    log(GDP_per_capita + 1),
+  data = df2,
+  method = "REML"
+)
+
+summary(gam_model2)
+gam.check(gam_model2)
+
+# Prediction grid
+new_data <- expand.grid(
+  log_displacement = seq(min(df2$log_displacement, na.rm = TRUE),
+                         max(df2$log_displacement, na.rm = TRUE),
+                         length.out = 100),
+  GDP_per_capita = median(df2$GDP_per_capita, na.rm = TRUE),
+  year = "2020",
+  country = "Afghanistan",
+  vaccine = levels(df2$vaccine)
+)
+
+# Predict with SE
+pred <- predict(gam_model2, newdata = new_data, se.fit = TRUE)
+new_data$fit <- pred$fit
+new_data$upper <- pred$fit + 1.96 * pred$se.fit
+new_data$lower <- pred$fit - 1.96 * pred$se.fit
+
+# Plot dose-response
+ggplot(new_data, aes(x = exp(log_displacement)-1, y = fit, color = vaccine, fill = vaccine)) +
+  geom_line(size = 1.2) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.05, color = NA) +
+  scale_x_continuous(labels = comma, limits = c(0, 100000)) +
+  scale_y_continuous(limits = c(40,80)) + 
+  labs(
+    x = "Total Fatalities from Natural Disaster",
+    y = "Predicted Vaccination Coverage (%)"
+    # subtitle = "Dose–Response (0–200k fatalities)"
+  ) +
+  theme_minimal(base_size = 14)
+
+new_data_disaster <- new_data
+
+
+### Add in displacement x natural disaster death vaccination prediction plot
+###combined model
+gam_model_combined <- gam(
+  Coverage ~ 
+    te(log(Total+1), log(Total.Deaths+1)) + 
+    factor(country) + 
+    factor(year) + 
+    factor(vaccine) + 
+    log(GDP_per_capita + 1),
+  data = df2,
+  method = "REML"
+)
+
+summary(gam_model_combined)
+gam.check(gam_model_combined)
+
+
+library(dplyr)
+library(ggplot2)
+library(viridis)
+library(akima)
+
+# ---------------------------
+# 1. Reference levels for factors
+# ---------------------------
+ref_country <- df2$country[1]
+ref_year    <- df2$year[1]
+ref_vaccine <- df2$vaccine[1]
+
+# ---------------------------
+# 2. Compute 1st and 99th percentiles to scale axes
+# ---------------------------
+Total_q <- quantile(df2$Total, probs = c(0.01, 0.99), na.rm = TRUE)
+Total.Deaths_q <- quantile(df2$Total.Deaths, probs = c(0.01, 0.99), na.rm = TRUE)
+
+# ---------------------------
+# 3. Create fine prediction grid
+# ---------------------------
+grid <- expand.grid(
+  Total   = seq(Total_q[1], Total_q[2], length.out = 500),  # higher resolution
+  Total.Deaths = seq(Total.Deaths_q[1], Total.Deaths_q[2], length.out = 500),
+  country = ref_country,
+  year    = ref_year,
+  vaccine = ref_vaccine,
+  GDP_per_capita = median(df2$GDP_per_capita, na.rm = TRUE)
+)
+
+# ---------------------------
+# 4. Convert to factors using same levels as training data
+# ---------------------------
+grid$country <- factor(grid$country, levels = levels(df2$country))
+grid$year    <- factor(grid$year, levels = levels(df2$year))
+grid$vaccine <- factor(grid$vaccine, levels = levels(df2$vaccine))
+
+# ---------------------------
+# 5. Predict vaccination coverage
+# ---------------------------
+grid$predicted_coverage <- predict(
+  gam_model_combined,
+  newdata = grid,
+  type = "response"
+)
+
+# ---------------------------
+# 6. Log-transform axes
+# ---------------------------
+grid <- grid %>%
+  mutate(
+    log_Total = log(Total + 1),
+    log_Total.Deaths = log(Total.Deaths + 1)
+  )
+
+# ---------------------------
+# 7. Smooth via bilinear interpolation (akima)
+# ---------------------------
+interp_grid <- with(grid, akima::interp(
+  x = log_Total,
+  y = log_Total.Deaths,
+  z = predicted_coverage,
+  xo = seq(min(log_Total), max(log_Total), length = 1000),
+  yo = seq(min(log_Total.Deaths), max(log_Total.Deaths), length = 1000),
+  linear = TRUE
+))
+
+smooth_df <- expand.grid(
+  log_Total = interp_grid$x,
+  log_Total.Deaths = interp_grid$y
+)
+smooth_df$predicted_coverage <- as.vector(interp_grid$z)
+
+# ---------------------------
+# 8. Plot smooth heatmap
+# ---------------------------
+ggplot(smooth_df, aes(x = log_Total, y = log_Total.Deaths, fill = predicted_coverage)) +
+  geom_raster(interpolate = TRUE) +  # smooth interpolation
+  scale_fill_viridis_c(option = "C", name = "Predicted Coverage") +
+  labs(
+    x = "Displaced population total (log)",
+    y = "Natural disaster deaths (log)"
+    # title = "Predicted Vaccination Coverage by Calendar Year Population Displacement and Battle Related Deaths"
+  ) +
+  theme_minimal(base_size = 14) +
+  geom_contour(aes(z = predicted_coverage), color = "white", binwidth = 5) +
+  coord_cartesian(
+    xlim = log(Total_q + 1), 
+    ylim = log(Total.Deaths_q + 1)
+  )
+
+
+######### ARMED CONFLICT ON VACCINATION ######### 
+
+#need to convert this code so that it pulls not just from which SIDE lost troops but in which LOCATIONS fatalities took place
+# get_ucdp_brd_country_year_full <- function(version = "25.1", pagesize = 300) {
+#   library(httr)
+#   library(jsonlite)
+#   library(dplyr)
+#   
+#   base_url <- paste0("https://ucdpapi.pcr.uu.se/api/battledeaths/", version)
+#   
+#   # Fetch first page to get total pages
+#   message("Fetching page 1")
+#   res <- GET(base_url, query = list(pagesize = pagesize, page = 1), timeout(600))
+#   stop_for_status(res)
+#   
+#   json <- fromJSON(content(res, "text", encoding = "UTF-8"), flatten = TRUE)
+#   total_pages <- json$TotalPages
+#   total_rows  <- json$TotalCount
+#   message("Total pages: ", total_pages, "; Total rows: ", total_rows)
+#   
+#   all_data <- list(json$Result)
+#   
+#   if (total_pages > 1) {
+#     for (p in 2:total_pages) {
+#       message("Fetching page ", p, " of ", total_pages)
+#       
+#       success <- FALSE
+#       retries <- 0
+#       while (!success && retries < 3) {
+#         try({
+#           res <- GET(base_url, query = list(pagesize = pagesize, page = p), timeout(600))
+#           stop_for_status(res)
+#           json <- fromJSON(content(res, "text", encoding = "UTF-8"), flatten = TRUE)
+#           all_data[[p]] <- json$Result
+#           success <- TRUE
+#         }, silent = TRUE)
+#         if (!success) {
+#           retries <- retries + 1
+#           message("Retrying page ", p, " (attempt ", retries, ")")
+#           Sys.sleep(5)
+#         }
+#       }
+#       if (!success) message("Failed to fetch page ", p, " after 3 attempts.")
+#     }
+#   }
+#   
+#   df_raw <- bind_rows(all_data)
+#   
+#   # Clean numeric fields
+#   df_raw <- df_raw %>%
+#     mutate(
+#       bd_best = as.numeric(bd_best),
+#       bd_low  = as.numeric(bd_low),
+#       bd_high = as.numeric(bd_high),
+#       year    = as.integer(year),
+#       battle_location = as.character(battle_location),
+#       gwno_battle = as.integer(gwno_battle)
+#     )
+#   
+#   # Safety check before aggregation
+#   total_bd_before <- sum(df_raw$bd_best, na.rm = TRUE)
+#   message("Total bd_best before aggregation: ", total_bd_before)
+#   
+#   # Aggregate by battle_location + gwno_battle (location where fighting occurred)
+#   df_loc <- df_raw %>%
+#     filter(!is.na(battle_location) | !is.na(gwno_battle)) %>%
+#     group_by(gwno_battle, battle_location, year) %>%
+#     summarise(
+#       bd_best = sum(bd_best, na.rm = TRUE),
+#       bd_low  = sum(bd_low, na.rm = TRUE),
+#       bd_high = sum(bd_high, na.rm = TRUE),
+#       .groups = "drop"
+#     ) %>%
+#     arrange(battle_location, year)
+#   
+#   # Safety check after aggregation
+#   total_bd_after <- sum(df_loc$bd_best, na.rm = TRUE)
+#   message("Total bd_best after aggregation: ", total_bd_after)
+#   
+#   if (!identical(total_bd_before, total_bd_after)) {
+#     warning("Mismatch in bd_best totals before and after aggregation! 
+#              This is expected if deaths were attributed to multiple locations.")
+#   }
+#   
+#   return(df_loc)
+# }
+# 
+# # Usage
+# ucdp_brd_cy <- get_ucdp_brd_country_year_full()
+
+
+
+
+get_ucdp_all_country_year <- function(version = "25.1", pagesize = 500) {
+  library(httr)
+  library(jsonlite)
+  library(dplyr)
+  library(purrr)
+  
+  # ---- Helper fetch function ----
+  fetch_ucdp <- function(endpoint, pagesize, version) {
+    base_url <- paste0("https://ucdpapi.pcr.uu.se/api/", endpoint, "/", version)
+    
+    message("Fetching ", endpoint, " data...")
+    res <- GET(base_url, query = list(pagesize = pagesize, page = 1), timeout(600))
+    stop_for_status(res)
+    json <- fromJSON(content(res, "text", encoding = "UTF-8"), flatten = TRUE)
+    
+    total_pages <- json$TotalPages
+    total_rows  <- json$TotalCount
+    message("Total pages for ", endpoint, ": ", total_pages, " (", total_rows, " rows)")
+    
+    all_data <- list(json$Result)
+    
+    if (total_pages > 1) {
+      for (p in 2:total_pages) {
+        success <- FALSE
+        retries <- 0
+        while (!success && retries < 3) {
+          try({
+            res <- GET(base_url, query = list(pagesize = pagesize, page = p), timeout(600))
+            stop_for_status(res)
+            json <- fromJSON(content(res, "text", encoding = "UTF-8"), flatten = TRUE)
+            all_data[[p]] <- json$Result
+            success <- TRUE
+          }, silent = TRUE)
+          if (!success) {
+            retries <- retries + 1
+            message("Retrying page ", p, " of ", total_pages, " (attempt ", retries, ")")
+            Sys.sleep(5)
+          }
+        }
+        if (!success) message("Failed to fetch page ", p, " after 3 attempts.")
+      }
+    }
+    
+    df_raw <- bind_rows(all_data)
+    
+    # ---- Standardize fatality columns ----
+    if ("bd_best" %in% names(df_raw)) {  # state-based
+      df_raw <- df_raw %>%
+        mutate(
+          bd_best = as.numeric(bd_best),
+          bd_low  = as.numeric(bd_low),
+          bd_high = as.numeric(bd_high),
+          gwno    = gwno_loc
+        )
+    } else if ("best_fatality_estimate" %in% names(df_raw)) {  # non-state or onesided
+      df_raw <- df_raw %>%
+        mutate(
+          bd_best = as.numeric(best_fatality_estimate),
+          bd_low  = as.numeric(low_fatality_estimate),
+          bd_high = as.numeric(high_fatality_estimate),
+          gwno    = gwno_location
+        )
+    } else {
+      stop("Fatality columns not found in ", endpoint)
+    }
+    
+    # Ensure year is integer
+    df_raw$year <- as.integer(df_raw$year)
+    
+    return(df_raw %>% select(conflict_id, gwno, year, bd_best, bd_low, bd_high))
+  }
+  
+  # ---- Fetch all datasets ----
+  state_df    <- fetch_ucdp("battledeaths", pagesize, version)
+  nonstate_df <- fetch_ucdp("nonstate", pagesize, version)
+  onesided_df <- fetch_ucdp("onesided", pagesize, version)
+  
+  # ---- Combine datasets ----
+  all_df <- bind_rows(state_df, nonstate_df, onesided_df)
+  
+  # Safety check before aggregation
+  total_bd_before <- sum(all_df$bd_best, na.rm = TRUE)
+  message("Total bd_best before aggregation: ", total_bd_before)
+  
+  # ---- Aggregate to GW-country-year ----
+  agg_df <- all_df %>%
+    filter(!is.na(gwno)) %>%
+    group_by(gwno, year) %>%
+    summarise(
+      bd_best = sum(bd_best, na.rm = TRUE),
+      bd_low  = sum(bd_low, na.rm = TRUE),
+      bd_high = sum(bd_high, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    arrange(gwno, year)
+  
+  total_bd_after <- sum(agg_df$bd_best, na.rm = TRUE)
+  message("Total bd_best after aggregation: ", total_bd_after)
+  
+  if (abs(total_bd_before - total_bd_after) > 0) {
+    warning("Mismatch in totals: some deaths may lack GW codes or be multi-coded.")
+  }
+  
+  return(agg_df)
+}
+
+# ---- Usage ----
+ucdp_all_cy <- get_ucdp_all_country_year()
+
+
+# Safety check: total before expansion
+total_bd_before <- sum(ucdp_all_cy$bd_best, na.rm = TRUE)
+message("Total bd_best before proportional allocation: ", total_bd_before)
+
+library(stringr)
+# Step 1: Split multi-GW codes
+ucdp_all_cy_optionA <- ucdp_all_cy %>%
+  mutate(
+    gwno_list = str_split(gwno, ","),
+    n_locations = lengths(gwno_list)
+  ) %>%
+  unnest(gwno_list) %>%
+  mutate(
+    gwno = str_trim(gwno_list),
+    bd_best = bd_best / n_locations,
+    bd_low  = bd_low  / n_locations,
+    bd_high = bd_high / n_locations
+  ) %>%
+  select(-gwno_list, -n_locations) %>%
+  arrange(gwno, year)
+
+# Step 2: Safety check: total after proportional allocation
+total_bd_after <- sum(ucdp_all_cy_optionA$bd_best, na.rm = TRUE)
+message("Total bd_best after proportional allocation: ", total_bd_after)
+
+if (abs(total_bd_before - total_bd_after) > 1e-6) {
+  warning("Totals do not match after proportional allocation!")
+} else {
+  message("Safety check passed: totals match after proportional allocation.")
+}
+
+
+# Step 1: Deduplicate gwstates
+gw_lookup <- gwstates %>%
+  group_by(gwcode) %>%
+  slice_max(end) %>%  # latest record if multiple periods
+  ungroup() %>%
+  mutate(gwcode = as.character(gwcode)) %>%  # make type compatible
+  select(gwcode, gwc)
+
+# Step 2: Merge UCDP with ISO3 codes
+ucdp_all_cy_iso <- ucdp_all_cy %>%
+  left_join(gw_lookup, by = c("gwno" = "gwcode"))
+
+# Step 3: Merge into vaccination data
+vaccination_with_brd <- vaccination_descriptive %>%
+  left_join(ucdp_all_cy_iso, by = c("Country.Code" = "gwc", "Year" = "year"))
+
+# Step 4: Fill missing BRD values
+vaccination_with_brd <- vaccination_with_brd %>%
+  mutate(across(c(bd_best, bd_low, bd_high), ~replace_na(.x, 0)))
+
+# Safety check
+total_brd_before <- sum(ucdp_all_cy$bd_best, na.rm = TRUE)
+total_brd_after  <- sum(vaccination_with_brd$bd_best, na.rm = TRUE)
+
+
+vaccination_descriptive2 <- vaccination_with_brd
+
+
+###begin with total affected persons
+df2 <- vaccination_descriptive2 %>%
+  mutate(
+    log_displacement = log1p(bd_best + 1),   # log transform because displacement is highly skewed
+    country = factor(Country),
+    year = factor(Year),
+    vaccine = factor(vaccine)
+  )
+
+# Fit a GAM with smooth term for displacement, country FE, and year FE
+gam_model3 <- gam(
+  Coverage ~ s(log_displacement, k = 8) + 
+    factor(country) + 
+    factor(year) + 
+    factor(vaccine) + 
+    log(GDP_per_capita + 1),
+  data = df2,
+  method = "REML"
+)
+
+summary(gam_model3)
+gam.check(gam_model3)
+
+# Prediction grid
+new_data <- expand.grid(
+  log_displacement = seq(min(df1$log_displacement, na.rm = TRUE),
+                         max(df1$log_displacement, na.rm = TRUE),
+                         length.out = 100),
+  GDP_per_capita = median(df2$GDP_per_capita, na.rm = TRUE),
+  year = "2020",
+  country = "Afghanistan",
+  vaccine = levels(df2$vaccine)
+)
+
+# Predict with SE
+pred <- predict(gam_model3, newdata = new_data, se.fit = TRUE)
+new_data$fit <- pred$fit
+new_data$upper <- pred$fit + 1.96 * pred$se.fit
+new_data$lower <- pred$fit - 1.96 * pred$se.fit
+
+# Plot dose-response
+ggplot(new_data, aes(x = exp(log_displacement)-1, y = fit, color = vaccine, fill = vaccine)) +
+  geom_line(size = 1.2) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.05, color = NA) +
+  scale_x_continuous(labels = comma, limits = c(0, 200000)) +
+  scale_y_continuous(limits = c(40,80)) + 
+  labs(
+    x = "Total Annual Battle-Related Deaths",
+    y = "Predicted Vaccination Coverage (%)"
+    # title = "Dose–Response (0–200k BRDs)"
+  ) +
+  theme_minimal(base_size = 14)
+
+new_data_brd <- new_data
+
+
+###combined model
+gam_model_combined <- gam(
+  Coverage ~ 
+    te(log(Total+1), log(bd_best+1)) + 
+    factor(country) + 
+    factor(year) + 
+    factor(vaccine) + 
+    log(GDP_per_capita + 1),
+  data = df2,
+  method = "REML"
+)
+
+summary(gam_model_combined)
+gam.check(gam_model_combined)
+
+
+library(dplyr)
+library(ggplot2)
+library(viridis)
+library(akima)
+
+# ---------------------------
+# 1. Reference levels for factors
+# ---------------------------
+ref_country <- df2$country[1]
+ref_year    <- df2$year[1]
+ref_vaccine <- df2$vaccine[1]
+
+# ---------------------------
+# 2. Compute 1st and 99th percentiles to scale axes
+# ---------------------------
+Total_q <- quantile(df2$Total, probs = c(0.01, 0.99), na.rm = TRUE)
+bd_best_q <- quantile(df2$bd_best, probs = c(0.01, 0.99), na.rm = TRUE)
+
+# ---------------------------
+# 3. Create fine prediction grid
+# ---------------------------
+grid <- expand.grid(
+  Total   = seq(Total_q[1], Total_q[2], length.out = 500),  # higher resolution
+  bd_best = seq(bd_best_q[1], bd_best_q[2], length.out = 500),
+  country = ref_country,
+  year    = ref_year,
+  vaccine = ref_vaccine,
+  GDP_per_capita = median(df2$GDP_per_capita, na.rm = TRUE)
+)
+
+# ---------------------------
+# 4. Convert to factors using same levels as training data
+# ---------------------------
+grid$country <- factor(grid$country, levels = levels(df2$country))
+grid$year    <- factor(grid$year, levels = levels(df2$year))
+grid$vaccine <- factor(grid$vaccine, levels = levels(df2$vaccine))
+
+# ---------------------------
+# 5. Predict vaccination coverage
+# ---------------------------
+grid$predicted_coverage <- predict(
+  gam_model_combined,
+  newdata = grid,
+  type = "response"
+)
+
+# ---------------------------
+# 6. Log-transform axes
+# ---------------------------
+grid <- grid %>%
+  mutate(
+    log_Total = log(Total + 1),
+    log_bd_best = log(bd_best + 1)
+  )
+
+# ---------------------------
+# 7. Smooth via bilinear interpolation (akima)
+# ---------------------------
+interp_grid <- with(grid, akima::interp(
+  x = log_Total,
+  y = log_bd_best,
+  z = predicted_coverage,
+  xo = seq(min(log_Total), max(log_Total), length = 1000),
+  yo = seq(min(log_bd_best), max(log_bd_best), length = 1000),
+  linear = TRUE
+))
+
+smooth_df <- expand.grid(
+  log_Total = interp_grid$x,
+  log_bd_best = interp_grid$y
+)
+smooth_df$predicted_coverage <- as.vector(interp_grid$z)
+
+# ---------------------------
+# 8. Plot smooth heatmap
+# ---------------------------
+ggplot(smooth_df, aes(x = log_Total, y = log_bd_best, fill = predicted_coverage)) +
+  geom_raster(interpolate = TRUE) +  # smooth interpolation
+  scale_fill_viridis_c(option = "C", name = "Predicted Coverage") +
+  labs(
+    x = "Displaced population total (log)",
+    y = "Battle-Related Deaths (log)"
+    # title = "Predicted Vaccination Coverage by Calendar Year Population Displacement and Battle Related Deaths"
+  ) +
+  theme_minimal(base_size = 14) +
+  geom_contour(aes(z = predicted_coverage), color = "white", binwidth = 5) +
+  coord_cartesian(
+    xlim = log(Total_q + 1), 
+    ylim = log(bd_best_q + 1)
+  )
+
+
+
+##### UNIFIED DOSE CURVE PLOT (STANDARDIZED X AXIS)
+
+### displacement
+new_data_displaced
+
+ggplot(new_data_displaced, aes(x = exp(log_displacement)-1, y = fit, color = vaccine, fill = vaccine)) +
+  geom_line(size = 1.2) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.05, color = NA) +
+  scale_x_continuous(labels = comma, limits = c(0, 600000)) +
+  scale_y_continuous(limits = c(40,80)) +
+  labs(
+    x = "Total Displaced Persons",
+    y = "Predicted Vaccination Coverage (%)"
+    # subtitle = "Dose–Response (0–500k displaced)"
+  ) +
+  theme_minimal(base_size = 14)
+
+# for displaced pct
+ggplot(new_data_displaced, aes(x = Displacement_Pct, y = fit, color = vaccine, fill = vaccine)) +
+  geom_line(size = 1.2) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.05, color = NA) +
+  scale_x_continuous(labels = comma, limits = c(0, 1)) +
+  scale_y_continuous(limits = c(40,80)) +
+  labs(
+    x = "Total Displaced Persons",
+    y = "Predicted Vaccination Coverage (%)"
+    # subtitle = "Dose–Response (0–500k displaced)"
+  ) +
+  theme_minimal(base_size = 14)
+
+
+### natural disaster
+# Plot dose-response
+head(as.data.frame(new_data_disaster))
+
+ggplot(new_data_disaster, aes(x = exp(log_displacement)-1, y = fit, color = vaccine, fill = vaccine)) +
+  geom_line(size = 1.2) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.05, color = NA) +
+  scale_x_continuous(labels = comma, limits = c(0, 100000)) +
+  scale_y_continuous(limits = c(40,80)) + 
+  labs(
+    x = "Total Fatalities from Natural Disaster",
+    y = "Predicted Vaccination Coverage (%)"
+    # subtitle = "Dose–Response (0–200k fatalities)"
+  ) +
+  theme_minimal(base_size = 14)
+
+
+### armed conflict
+head(as.data.frame(new_data_brd))
+
+ggplot(new_data_brd, aes(x = exp(log_displacement)-1, y = fit, color = vaccine, fill = vaccine)) +
+  geom_line(size = 1.2) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.05, color = NA) +
+  scale_x_continuous(labels = comma, limits = c(0, 20000)) +
+  scale_y_continuous(limits = c(40,80)) + 
+  labs(
+    x = "Total Annual Battle-Related Deaths",
+    y = "Predicted Vaccination Coverage (%)"
+    # title = "Dose–Response (0–200k BRDs)"
+  ) +
+  theme_minimal(base_size = 14)
+
+
+
+#### unified plot
+
+# Standardize x-axis within each dataset
+new_data_displaced <- new_data_displaced %>%
+  mutate(x_std = (exp(log_displacement)-1 - min(exp(log_displacement)-1)) /
+           (max(exp(log_displacement)-1) - min(exp(log_displacement)-1)),
+         exposure_type = "Displacement")
+
+new_data_disaster <- new_data_disaster %>%
+  mutate(x_std = (exp(log_displacement)-1 - min(exp(log_displacement)-1)) /
+           (max(exp(log_displacement)-1) - min(exp(log_displacement)-1)),
+         exposure_type = "Natural Disaster")
+
+new_data_brd <- new_data_brd %>%
+  mutate(x_std = (exp(log_displacement)-1 - min(exp(log_displacement)-1)) /
+           (max(exp(log_displacement)-1) - min(exp(log_displacement)-1)),
+         exposure_type = "Armed Conflict")
+
+# Combine all datasets
+unified_data <- bind_rows(new_data_displaced, new_data_disaster, new_data_brd)
+
+
+ggplot(unified_data, aes(x = x_std, y = fit, color = exposure_type, fill = exposure_type)) +
+  geom_smooth(method = "gam", formula = y ~ s(x, bs="cs"), se = TRUE, alpha = 0.2, size = 1.2) +
+  scale_x_continuous(labels = scales::percent_format(accuracy = 1)) +
+  scale_y_continuous(limits = c(40, 80)) +
+  labs(
+    x = "Relative Exposure (0–100%)",
+    y = "Predicted Vaccination Coverage (%)",
+    color = "Exposure Type",
+    fill = "Exposure Type"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "right")
+
+test_df <- as.data.frame(df)
+nrow(test_df[which(test_df$Displacement_Pct>=0.4),])
+
