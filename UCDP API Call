@@ -1,0 +1,67 @@
+# Function to fetch and standardize fatality data from state-based, non-state, and one-sided UCDP datasets
+get_ucdp_all_country_year <- function(version = "25.1", pagesize = 500) {
+  library(httr)
+  library(jsonlite)
+  library(dplyr)
+  
+  fetch_ucdp <- function(endpoint, pagesize, version) {
+    base_url <- paste0("https://ucdpapi.pcr.uu.se/api/", endpoint, "/", version)
+    
+    message("Fetching ", endpoint, " data...")
+    res <- GET(base_url, query = list(pagesize = pagesize, page = 1), timeout(600))
+    stop_for_status(res)
+    json <- fromJSON(content(res, "text", encoding = "UTF-8"), flatten = TRUE)
+    
+    total_pages <- json$TotalPages
+    all_data <- list(json$Result)
+    
+    if (total_pages > 1) {
+      for (p in 2:total_pages) {
+        success <- FALSE
+        retries <- 0
+        while (!success && retries < 3) {
+          try({
+            res <- GET(base_url, query = list(pagesize = pagesize, page = p), timeout(600))
+            stop_for_status(res)
+            json <- fromJSON(content(res, "text", encoding = "UTF-8"), flatten = TRUE)
+            all_data[[p]] <- json$Result
+            success <- TRUE
+          }, silent = TRUE)
+          if (!success) {
+            retries <- retries + 1
+            Sys.sleep(5)
+          }
+        }
+      }
+    }
+    
+    df_raw <- bind_rows(all_data)
+    
+    # Standardize column naming across different UCDP endpoints
+    if ("bd_best" %in% names(df_raw)) {
+      df_raw <- df_raw %>% mutate(bd_best = as.numeric(bd_best), gwno = gwno_loc)
+    } else if ("best_fatality_estimate" %in% names(df_raw)) {
+      df_raw <- df_raw %>% mutate(bd_best = as.numeric(best_fatality_estimate), gwno = gwno_location)
+    }
+    
+    return(df_raw %>% select(conflict_id, gwno, year, bd_best))
+  }
+  
+  # Fetch and combine all three conflict types
+  all_df <- bind_rows(
+    fetch_ucdp("battledeaths", pagesize, version),
+    fetch_ucdp("nonstate", pagesize, version),
+    fetch_ucdp("onesided", pagesize, version)
+  )
+  
+  # Aggregate to country-year level
+  agg_df <- all_df %>%
+    filter(!is.na(gwno)) %>%
+    group_by(gwno, year = as.integer(year)) %>%
+    summarise(bd_best = sum(bd_best, na.rm = TRUE), .groups = "drop")
+  
+  return(agg_df)
+}
+
+# Execute call
+ucdp_all_cy <- get_ucdp_all_country_year()
