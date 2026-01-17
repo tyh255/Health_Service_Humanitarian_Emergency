@@ -2,9 +2,10 @@
 Replication code for the article, "Health Service Delivery During Humanitarian Emergencies: Quantifying the Impact of Forcibly Displaced Populations, Armed Conflict, and Natural Disasters"
 
 Project Overview
+
 The objective of this analysis is to quantify how various humanitarian stressors affect vaccination systems. It handles data ingestion from the UCDP API, merges multi-source panel data (World Bank, EM-DAT, and Vaccination records), and executes econometric modeling.
 
-1. Displacement Shock Analysis (DiD)
+1. Displacement Shock Analysis (DiD): 
 This module identifies "shocks" in population displacement based on both relative growth and absolute population thresholds.
 Methodology: Staggered Difference-in-Differences with a 3-year treatment window.
 Key Function: run_did_analysis()
@@ -13,14 +14,14 @@ Dynamic shock detection based on customizable growth_threshold and absolute_thre
 Interaction terms to evaluate how conflict intensity (None, Low, High) moderates the impact of displacement.
 Event study preparation to validate the parallel trends assumption.
 
-2. UCDP Data Pipeline
+2. UCDP Data Pipeline: 
 Automates the retrieval of conflict data directly from the Uppsala Conflict Data Program (UCDP) API.
 Endpoints: State-based battle deaths, non-state conflict, and one-sided violence.
   Processing:
 Proportional allocation: Deaths in multi-country conflicts are split across participating Gleditsch-Ward (GW) country codes to prevent double-counting.
 Automated pagination and retry logic for API stability.
 
-3. Non-Linear Dose-Response (GAMs)
+3. Non-Linear Dose-Response (GAMs): 
 Uses Generalized Additive Models to move beyond binary "shocks" and explore the continuous impact of stressors.
 Model Specification: Coverage ~ s(Stressors) + Fixed Effects + Controls
 Stressors Modeled: * Log-transformed total displacement.
@@ -48,7 +49,7 @@ Outcomes: Coverage (Vaccination percentage).
 Predictors: Total (Displaced persons), GDP_per_capita.
 Factors: Category (Conflict intensity), vaccine (Type of vaccine).
 
-How to Run
+How to Run: 
 Initialize Data: Ensure your base vaccination and population dataframes are loaded.
 Execute API Fetch: Run get_ucdp_all_country_year() to pull current conflict data.
 Run DiD: Use run_did_analysis() to test for immediate coverage drops following major displacement events.
