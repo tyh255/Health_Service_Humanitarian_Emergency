@@ -1,0 +1,799 @@
+# ============================================================
+# Replication code — displacement shocks & childhood vaccination coverage
+# Headley, Shay & Tozan (under revision, Nature Communications)
+#
+# Reproduces the headline results:
+#   1. panel construction (WUENIC + UCDP + UNHCR + EM-DAT + WB)
+#   2. threshold DiD models (Tables 3 & 4): TWFE with country-vaccine
+#      unit FE, Callaway-Sant'Anna + Sun-Abraham cross-checks,
+#      HonestDiD pre-trend sensitivity, pre-shock locked conflict tiers
+#   3. GAM dose-response curves
+#   4. omitted-variable-bias sensitivity (sensemakr)
+#
+# Raw data files aren't redistributed here -- see the paper's Data
+# Availability statement. The script assumes you've already read in:
+#   intro_data, vaccine_long_merged, ucdp_ov, unhcr, disaster_data
+# and that data/WB_Population Data.csv exists.
+# ============================================================
+
+library(dplyr); library(tidyr); library(purrr); library(stringr)
+library(readxl); library(countrycode)
+library(fixest); library(broom); library(did); library(HonestDiD)
+
+dir.create("results", showWarnings = FALSE)
+
+# plm masks dplyr::lag and silently returns the input unchanged, which
+# once gave us zero shocks everywhere. never again.
+if ("package:plm" %in% search()) detach("package:plm", unload = TRUE)
+stopifnot(identical(lag, dplyr::lag))
+
+
+# ------------------------------------------------------------
+# 1. BUILD THE PANEL
+# ------------------------------------------------------------
+
+# normalize WHO intro data and map antigen names onto our vaccine codes
+intro_data_clean <- intro_data %>%
+  mutate(
+    INTRO_Binary = ifelse(str_detect(INTRO, "^Yes"), "Yes", "No"),
+    vaccine_match = case_when(
+      ANTIGEN == "HEPB3"       ~ "HEPB3",
+      ANTIGEN == "HIB"         ~ "HIB3",
+      ANTIGEN == "MCV2"        ~ "MCV2",
+      ANTIGEN == "PNEUMO_CONJ" ~ "PCV3",
+      ANTIGEN == "RUBELLA"     ~ "RCV1",
+      TRUE ~ ANTIGEN
+    )
+  ) %>%
+  select(Country.Code = ISO_3_CODE, Year = YEAR, vaccine = vaccine_match, INTRO_Binary)
+
+vaccine_final <- vaccine_long_merged %>%
+  left_join(intro_data_clean, by = c("Country.Code", "Year", "vaccine")) %>%
+  mutate(
+    # the original six are in every schedule
+    INTRO_Binary = ifelse(vaccine %in% c("BCG", "DTP1", "DTP3", "MCV1", "POL3"),
+                          "Yes", INTRO_Binary),
+    INTRO_Binary = ifelse(is.na(INTRO_Binary), "No", INTRO_Binary)
+  )
+
+stopifnot(nrow(vaccine_final) ==
+            nrow(distinct(vaccine_final, Country.Code, Year, vaccine)))
+
+# country-year index (used for GDP lag construction below)
+final_analysis_data <- vaccine_final %>%
+  group_by(Country.Code, Year) %>%
+  summarize(
+    Country           = first(Country),
+    GDP_per_capita    = first(GDP_per_capita),
+    ImmunizationIndex = mean(Coverage, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# external sources
+wbpop_long <- read.csv("data/WB_Population Data.csv") %>%
+  pivot_longer(cols = starts_with("X"), names_to = "Year", values_to = "Population") %>%
+  mutate(Year = as.numeric(str_extract(Year, "\\d{4}"))) %>%
+  select(Country.Code, Year, Population) %>%
+  dplyr::filter(!is.na(Population))
+
+ucdp_cleaned <- ucdp_ov %>%
+  mutate(
+    iso3 = countrycode(country_id_cy, origin = "gwn", destination = "iso3c"),
+    year = as.numeric(year_cy),
+    brd_new = sb_total_deaths_best_cy,
+    conflict_active_new = ifelse(sb_exist_cy == 1, 1, 0)
+  ) %>%
+  dplyr::filter(!is.na(iso3)) %>%
+  select(iso3, year, brd_new, conflict_active_new)
+
+unhcr_subset <- unhcr %>%
+  select(Country.of.Origin.ISO, Year, unhcr_total_displaced = Total)
+
+affected_summary <- disaster_data %>%
+  group_by(ISO, Start.Year) %>%
+  summarise(
+    disaster_total_affected = sum(Total.Affected, na.rm = TRUE),
+    disaster_sum_fatality   = sum(Total.Deaths,   na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# lagged log GDP, built at country-year level then merged back in --
+# computing it inside the country-year-vaccine frame double-counts years
+gdp_lag_table <- final_analysis_data %>%
+  select(Country.Code, Year, GDP_per_capita) %>%
+  group_by(Country.Code) %>%
+  arrange(Year, .by_group = TRUE) %>%
+  mutate(GDP_lag = log(dplyr::lag(GDP_per_capita))) %>%
+  ungroup() %>%
+  select(Country.Code, Year, GDP_lag)
+
+# the master merge
+vaccine_long_updated <- vaccine_final %>%
+  mutate(Year = as.numeric(Year)) %>%
+  left_join(ucdp_cleaned,     by = c("Country.Code" = "iso3", "Year" = "year")) %>%
+  left_join(unhcr_subset,     by = c("Country.Code" = "Country.of.Origin.ISO", "Year")) %>%
+  left_join(affected_summary, by = c("Country.Code" = "ISO", "Year" = "Start.Year")) %>%
+  left_join(wbpop_long,       by = c("Country.Code", "Year")) %>%
+  left_join(gdp_lag_table,    by = c("Country.Code", "Year")) %>%
+  mutate(
+    brd_new                 = coalesce(brd_new, 0),
+    conflict_active_new     = coalesce(conflict_active_new, 0),
+    unhcr_total_displaced   = coalesce(unhcr_total_displaced, 0),
+    disaster_total_affected = coalesce(disaster_total_affected, 0),
+    disaster_sum_fatality   = coalesce(disaster_sum_fatality, 0),
+    Population              = as.numeric(Population),
+    percent_pop_displaced   = (unhcr_total_displaced / Population) * 100
+  )
+
+stopifnot(nrow(vaccine_long_updated) ==
+            nrow(distinct(vaccine_long_updated, Country.Code, Year, vaccine)))
+
+
+# ------------------------------------------------------------
+# 2. SHARED HELPERS
+# ------------------------------------------------------------
+
+MBAR_MAX <- 3   # keep in sync with Mbarvec inside the HonestDiD wrapper
+
+fmt_ci <- function(est, se) {
+  if (any(is.na(c(est, se)))) return("—")
+  sprintf("%.2f (%.2f, %.2f)", est, est - 1.96 * se, est + 1.96 * se)
+}
+
+# per-tier effects via linear combinations read straight off vcov(feols).
+# we used avg_slopes() for this originally and it silently failed to pick
+# up the clustered vcov -- don't go back.
+lincom <- function(model, terms) {
+  if (is.null(model)) return(c(est = NA_real_, se = NA_real_))
+  b <- coef(model); V <- vcov(model)
+  if (any(!terms %in% names(b))) return(c(est = NA_real_, se = NA_real_))
+  cv <- setNames(rep(0, length(b)), names(b)); cv[terms] <- 1
+  c(est = sum(cv * b), se = sqrt(as.numeric(t(cv) %*% V %*% cv)))
+}
+
+# HonestDiD wrapper for a CS att_gt object. two things matter here:
+#   - the universal base period row (e = -1, se = 0) has to be dropped
+#     BEFORE sigma is built, otherwise sigma is singular and the robust
+#     CIs come back impossibly narrow
+#   - the Mbar grid runs to 3, because a 2.0 cap was pinning breakdowns
+run_honestdid_sensitivity <- function(cs_att_object,
+                                      event_time = 0,
+                                      min_e      = -3,
+                                      max_e      = NULL,
+                                      aggregate  = FALSE,
+                                      l_vec      = NULL,
+                                      Mbarvec    = seq(0.25, 3, by = 0.25)) {
+
+  na_out <- tibble(cs_breakdown_mbar = NA_real_,
+                   robust_lo_mbar1 = NA_real_, robust_hi_mbar1 = NA_real_)
+  if (is.null(cs_att_object)) return(na_out)
+
+  agg_args <- list(cs_att_object, type = "dynamic", na.rm = TRUE, min_e = min_e)
+  if (!is.null(max_e)) agg_args$max_e <- max_e
+  es <- tryCatch(do.call(did::aggte, agg_args), error = function(e) NULL)
+  if (is.null(es)) return(na_out)
+
+  egt <- es$egt; betahat <- es$att.egt; se0 <- es$se.egt
+  if_mat <- es$inf.function$dynamic.inf.func.e
+
+  # drop the reference period before anything else
+  drop_idx <- which(egt == -1 | se0 == 0 | is.na(se0))
+  if (length(drop_idx) > 0) {
+    egt <- egt[-drop_idx]; betahat <- betahat[-drop_idx]; se0 <- se0[-drop_idx]
+    if (!is.null(if_mat) && is.matrix(if_mat))
+      if_mat <- if_mat[, -drop_idx, drop = FALSE]
+  }
+
+  num_pre  <- sum(egt < 0)
+  num_post <- sum(egt >= 0)
+  if (num_pre < 2 || num_post < 1) return(na_out)
+
+  # build sigma from the influence function; did's internal normalization
+  # isn't documented so just pick whichever reproduces the reported SEs
+  sigma <- tryCatch({
+    if (!is.null(if_mat) && is.matrix(if_mat)) {
+      n  <- nrow(if_mat)
+      s1 <- crossprod(if_mat) / n
+      s2 <- crossprod(if_mat) / (n^2)
+      d1 <- max(abs(sqrt(diag(s1)) - se0), na.rm = TRUE)
+      d2 <- max(abs(sqrt(diag(s2)) - se0), na.rm = TRUE)
+      if (d2 < d1) s2 else s1
+    } else diag(se0^2)
+  }, error = function(e) diag(se0^2))
+  if (!is.matrix(sigma) || any(is.na(sigma)) || nrow(sigma) != length(egt))
+    sigma <- diag(se0^2)
+
+  # target vector matches whatever estimand we're quoting
+  if (is.null(l_vec)) {
+    if (aggregate) {
+      l_vec <- rep(1 / num_post, num_post)   # uniform post-window average
+    } else {
+      post_egt <- egt[egt >= 0]
+      idx <- which(post_egt == event_time)
+      if (length(idx) == 0) return(na_out)
+      l_vec <- rep(0, num_post); l_vec[idx] <- 1
+    }
+  }
+
+  sens <- tryCatch(
+    HonestDiD::createSensitivityResults_relativeMagnitudes(
+      betahat = betahat, sigma = sigma,
+      numPrePeriods = num_pre, numPostPeriods = num_post,
+      l_vec = l_vec, Mbarvec = Mbarvec),
+    error = function(e) NULL)
+  if (is.null(sens)) return(na_out)
+
+  sens$includes_zero <- (sens$lb <= 0 & sens$ub >= 0)
+  brk <- sens[sens$includes_zero & sens$Mbar > 0, ]
+  breakdown <- if (nrow(brk) > 0) min(brk$Mbar) else
+    max(sens$Mbar) + min(diff(sort(unique(sens$Mbar))))   # = "off the grid"
+
+  i1 <- which.min(abs(sens$Mbar - 1))
+
+  # sanity: a robust CI can never be tighter than the naive one
+  orig <- tryCatch(
+    HonestDiD::constructOriginalCS(betahat = betahat, sigma = sigma,
+                                   numPrePeriods = num_pre,
+                                   numPostPeriods = num_post, l_vec = l_vec),
+    error = function(e) NULL)
+  if (!is.null(orig)) {
+    if ((sens$ub[i1] - sens$lb[i1]) / 2 < (orig$ub - orig$lb) / 2 - 1e-6)
+      warning("HonestDiD robust CI narrower than naive — check sigma / reference drop.")
+  }
+
+  tibble(cs_breakdown_mbar = breakdown,
+         robust_lo_mbar1 = sens$lb[i1], robust_hi_mbar1 = sens$ub[i1])
+}
+
+
+# ------------------------------------------------------------
+# 3. MAIN THRESHOLD DiD (Tables 3 & 4)
+# ------------------------------------------------------------
+# one function for both the absolute and percent grids; disp_var picks
+# which displacement measure defines the shock.
+
+run_did_threshold_model <- function(df, disp_var, threshold, growth_t,
+                                    window_size = 1) {
+
+  df_shocks <- df %>%
+    group_by(Country.Code, vaccine) %>%
+    arrange(Year, .by_group = TRUE) %>%
+    mutate(
+      lag_disp = dplyr::lag(.data[[disp_var]]),
+      growth = if_else(!is.na(lag_disp) & lag_disp > 0,
+                       (.data[[disp_var]] - lag_disp) / lag_disp, NA_real_),
+      shock = case_when(
+        is.na(growth) ~ 0L,
+        growth >= growth_t & .data[[disp_var]] >= threshold ~ 1L,
+        TRUE ~ 0L)
+    ) %>%
+    group_by(Country.Code) %>%
+    mutate(
+      first_shock_year = if (any(shock == 1, na.rm = TRUE))
+        min(Year[shock == 1], na.rm = TRUE) else NA_real_,
+      treat = if_else(!is.na(first_shock_year), 1L, 0L),
+      event_time = Year - first_shock_year
+    ) %>%
+    ungroup() %>%
+    mutate(
+      post = if_else(!is.na(event_time) & event_time >= 0 &
+                       event_time < window_size, 1L, 0L),
+      conflict_tier = factor(case_when(
+        brd_new >= 1000 ~ "War",
+        brd_new >= 25   ~ "Low-level",
+        TRUE            ~ "None"), levels = c("None", "Low-level", "War")),
+      id_var = paste(Country.Code, vaccine, sep = "_")   # country x vaccine unit
+    )
+
+  df_mod <- df_shocks %>%
+    dplyr::filter(treat == 0L |
+                    (treat == 1L & event_time >= -5 & event_time <= window_size - 1))
+  if (sum(df_mod$post, na.rm = TRUE) == 0) {
+    warning(sprintf("no shocks at %s >= %s, growth >= %s — skipping",
+                    disp_var, threshold, growth_t))
+    return(NULL)
+  }
+  win_lab <- ifelse(window_size == 1, "Year 1", "Years 1-3")
+
+  # headline interaction model. unit + year FE matters a lot here: with
+  # only vaccine + year FE the post effects pick up between-country level
+  # differences and come out way too big.
+  m <- tryCatch(
+    feols(Coverage ~ post * conflict_tier + GDP_lag | id_var + Year,
+          data = df_mod, cluster = ~Country.Code),
+    error = function(e) NULL)
+  if (is.null(m)) return(NULL)
+
+  cf <- names(coef(m))
+  nm_low <- grep("^post:conflict_tier.*Low", cf, value = TRUE)[1]
+  nm_war <- grep("^post:conflict_tier.*War", cf, value = TRUE)[1]
+  none_eff <- lincom(m, "post")
+  low_eff  <- if (!is.na(nm_low)) lincom(m, c("post", nm_low)) else c(est = NA_real_, se = NA_real_)
+  war_eff  <- if (!is.na(nm_war)) lincom(m, c("post", nm_war)) else c(est = NA_real_, se = NA_real_)
+
+  res <- broom::tidy(m)
+  b  <- function(tn) { v <- res$estimate[res$term == tn];  if (length(v) == 0) NA_real_ else v }
+  se <- function(tn) { v <- res$std.error[res$term == tn]; if (length(v) == 0) NA_real_ else v }
+
+  w_int <- tryCatch(fixest::wald(m, "post:conflict_tier"), error = function(e) NULL)
+  int_p <- if (!is.null(w_int)) w_int$p else NA_real_
+
+  # --- collider check: lock conflict tier at its pre-shock value ---
+  # treated units take T-1 (fallback T-2; never T0, since shock-year battle
+  # deaths could already be displacement-induced). treated units with
+  # neither pre-year observed get dropped rather than defaulted.
+  treated_tier <- df_shocks %>%
+    dplyr::filter(treat == 1L, !is.na(brd_new)) %>%
+    distinct(Country.Code, Year, brd_new, first_shock_year) %>%
+    dplyr::filter(Year %in% c(first_shock_year - 1L, first_shock_year - 2L)) %>%
+    mutate(rel = Year - first_shock_year) %>%
+    group_by(Country.Code) %>% arrange(desc(rel), .by_group = TRUE) %>%  # -1 wins over -2
+    slice(1) %>% ungroup() %>%
+    transmute(Country.Code,
+              tier_locked = case_when(brd_new >= 1000 ~ "War",
+                                      brd_new >= 25   ~ "Low-level",
+                                      TRUE            ~ "None"))
+  # controls keep their own observed status (absorbed by the unit FE anyway,
+  # since post == 0 for every control row -- this is purely defensive)
+  control_tier <- df_shocks %>%
+    dplyr::filter(treat == 0L) %>%
+    group_by(Country.Code) %>%
+    summarise(max_brd = if (all(is.na(brd_new))) NA_real_ else max(brd_new, na.rm = TRUE),
+              .groups = "drop") %>%
+    transmute(Country.Code,
+              tier_locked = case_when(is.na(max_brd)  ~ "None",
+                                      max_brd >= 1000 ~ "War",
+                                      max_brd >= 25   ~ "Low-level",
+                                      TRUE            ~ "None"))
+  tier_lock_lkp <- bind_rows(treated_tier, control_tier)
+
+  treated_no_base <- df_mod %>% dplyr::filter(treat == 1L) %>%
+    distinct(Country.Code) %>%
+    anti_join(treated_tier, by = "Country.Code") %>% pull(Country.Code)
+
+  df_mod_locked <- df_mod %>%
+    dplyr::filter(!(treat == 1L & Country.Code %in% treated_no_base)) %>%
+    left_join(tier_lock_lkp, by = "Country.Code") %>%
+    mutate(tier_locked = factor(coalesce(tier_locked, "None"),
+                                levels = c("None", "Low-level", "War")))
+  m_locked <- tryCatch(
+    feols(Coverage ~ post * tier_locked + GDP_lag | id_var + Year,
+          data = df_mod_locked, cluster = ~Country.Code),
+    error = function(e) NULL)
+  cf_l <- if (!is.null(m_locked)) names(coef(m_locked)) else character(0)
+  nm_low_l <- grep("^post:tier_locked.*Low", cf_l, value = TRUE)[1]
+  nm_war_l <- grep("^post:tier_locked.*War", cf_l, value = TRUE)[1]
+  none_l <- lincom(m_locked, "post")
+  low_l  <- if (!is.na(nm_low_l)) lincom(m_locked, c("post", nm_low_l)) else c(est = NA_real_, se = NA_real_)
+  war_l  <- if (!is.na(nm_war_l)) lincom(m_locked, c("post", nm_war_l)) else c(est = NA_real_, se = NA_real_)
+  w_int_l <- tryCatch(fixest::wald(m_locked, "post:tier_locked"), error = function(e) NULL)
+  int_p_l <- if (!is.null(w_int_l)) w_int_l$p else NA_real_
+
+  # --- pre-trend test 1: treated-only event study. flawed (no clean
+  # comparison group) but kept so the SI can show it against the fix.
+  pt_original <- "Yes"
+  es_orig <- tryCatch(
+    feols(Coverage ~ i(event_time, ref = -1) + GDP_lag + conflict_tier | id_var + Year,
+          data = df_shocks %>%
+            dplyr::filter(!is.na(event_time) & event_time >= -5 & event_time <= 5),
+          cluster = ~Country.Code),
+    error = function(e) NULL)
+  if (!is.null(es_orig) && length(grep("event_time::-", names(coef(es_orig)))) > 0) {
+    w <- tryCatch(wald(es_orig, keep = "event_time::-"), error = function(e) NULL)
+    if (!is.null(w) && !is.na(w$p) && w$p < 0.05) pt_original <- "No"
+  }
+
+  # --- pre-trend test 2: corrected TWFE event study, never-treated as ref
+  pt_twfe <- "Yes"
+  df_es <- df_shocks %>%
+    mutate(event_time_capped = case_when(
+      treat == 0L       ~ -1L,
+      is.na(event_time) ~ -1L,
+      event_time < -5   ~ -1L,
+      event_time >  5   ~ -1L,
+      TRUE              ~ as.integer(event_time)))
+  es_twfe <- tryCatch(
+    feols(Coverage ~ i(event_time_capped, ref = -1) + GDP_lag + conflict_tier | id_var + Year,
+          data = df_es, cluster = ~Country.Code),
+    error = function(e) NULL)
+  if (!is.null(es_twfe) && length(grep("event_time_capped::-", names(coef(es_twfe)))) > 0) {
+    w <- tryCatch(wald(es_twfe, keep = "event_time_capped::-"), error = function(e) NULL)
+    if (!is.null(w) && !is.na(w$p) && w$p < 0.05) pt_twfe <- "No"
+  }
+
+  # --- Callaway-Sant'Anna headline + HonestDiD ---
+  # est_method = "reg" is load-bearing: the default doubly-robust estimator
+  # quasi-separates on GDP_lag in small treated cells and was silently
+  # kicking every spec down to the unadjusted fallback.
+  cs_data <- df_shocks %>%
+    mutate(g_var  = if_else(treat == 1L, as.integer(first_shock_year), 0L),
+           id_int = as.integer(as.factor(id_var)),   # did wants an integer id
+           Year   = as.integer(Year)) %>%
+    dplyr::filter(!is.na(Coverage))
+  cs_feed <- cs_data %>% dplyr::filter(!is.na(GDP_lag))
+
+  cs_att_object <- tryCatch(
+    suppressWarnings(did::att_gt(
+      yname = "Coverage", tname = "Year", idname = "id_int", gname = "g_var",
+      xformla = ~ GDP_lag, data = cs_feed,
+      control_group = "nevertreated", clustervars = "Country.Code",
+      panel = TRUE, allow_unbalanced_panel = TRUE,
+      base_period = "universal", est_method = "reg", print_details = FALSE)),
+    error = function(e) NULL)
+  cs_xformla_used <- if (!is.null(cs_att_object)) "GDP_lag" else NA_character_
+  if (is.null(cs_att_object)) {
+    cs_att_object <- tryCatch(
+      suppressWarnings(did::att_gt(
+        yname = "Coverage", tname = "Year", idname = "id_int", gname = "g_var",
+        data = cs_data, control_group = "nevertreated", clustervars = "Country.Code",
+        panel = TRUE, allow_unbalanced_panel = TRUE,
+        base_period = "universal", print_details = FALSE)),
+      error = function(e) NULL)
+    if (!is.null(cs_att_object)) cs_xformla_used <- "unadjusted"
+  }
+
+  cs_simple_att <- NA_real_; cs_simple_se <- NA_real_; pt_cs <- NA_character_
+  cs_dynamic_df <- NULL
+  cs_breakdown_mbar <- NA_real_; robust_lo <- NA_real_; robust_hi <- NA_real_
+
+  if (!is.null(cs_att_object)) {
+    if (!is.null(cs_att_object$Wpval) && !is.na(cs_att_object$Wpval))
+      pt_cs <- if (cs_att_object$Wpval < 0.05) "No" else "Yes"
+
+    cs_win <- tryCatch(
+      did::aggte(cs_att_object, type = "dynamic",
+                 min_e = 0, max_e = window_size - 1, na.rm = TRUE),
+      error = function(e) NULL)
+    if (!is.null(cs_win)) {
+      cs_simple_att <- cs_win$overall.att; cs_simple_se <- cs_win$overall.se
+    }
+
+    cs_es <- tryCatch(
+      did::aggte(cs_att_object, type = "dynamic", min_e = -5, max_e = 5, na.rm = TRUE),
+      error = function(e) NULL)
+    if (!is.null(cs_es))
+      cs_dynamic_df <- tibble(
+        disp_var = disp_var, threshold = threshold,
+        growth_threshold = paste0(growth_t * 100, "%"), window = win_lab,
+        event_time = cs_es$egt, att = cs_es$att.egt, se = cs_es$se.egt)
+
+    hdid <- tryCatch(
+      run_honestdid_sensitivity(cs_att_object, event_time = 0, min_e = -3,
+                                max_e = window_size - 1,
+                                aggregate = (window_size > 1)),
+      error = function(e) NULL)
+    if (!is.null(hdid)) {
+      cs_breakdown_mbar <- hdid$cs_breakdown_mbar[1]
+      robust_lo <- hdid$robust_lo_mbar1[1]; robust_hi <- hdid$robust_hi_mbar1[1]
+    }
+  }
+  if (is.na(pt_cs)) pt_cs <- "—"
+
+  # --- Sun-Abraham cross-check on the same windowed frame ---
+  sa_att <- NA_real_; sa_se <- NA_real_
+  d_sa <- df_mod %>%
+    mutate(cohort_sun = if_else(treat == 1L, as.integer(first_shock_year), 10000L))
+  m_sa <- tryCatch(
+    feols(Coverage ~ sunab(cohort_sun, Year) + GDP_lag | id_var + Year,
+          data = d_sa, cluster = ~Country.Code),
+    error = function(e) NULL)
+  if (!is.null(m_sa)) {
+    agg <- tryCatch(summary(m_sa, agg = "att"), error = function(e) NULL)
+    if (!is.null(agg)) {
+      ct <- agg$coeftable
+      r <- ct[grepl("ATT", rownames(ct), ignore.case = TRUE), , drop = FALSE]
+      if (nrow(r) >= 1) { sa_att <- r[1, 1]; sa_se <- r[1, 2] }
+    }
+  }
+
+  cs_breakdown_str <- if (is.na(cs_breakdown_mbar)) "—" else
+    if (cs_breakdown_mbar > MBAR_MAX) sprintf(">%.1f", MBAR_MAX) else
+      sprintf("%.2f", cs_breakdown_mbar)
+
+  main_row <- tibble(
+    disp_var = disp_var, threshold = threshold,
+    growth_threshold = paste0(growth_t * 100, "%"), window = win_lab,
+    n_treated_countries = length(unique(
+      df_mod$Country.Code[df_mod$treat == 1L & df_mod$post == 1L])),
+    n_treated_obs = sum(df_mod$post, na.rm = TRUE),
+    effect_post_none = fmt_ci(none_eff["est"], none_eff["se"]),
+    effect_post_low  = fmt_ci(low_eff["est"],  low_eff["se"]),
+    effect_post_war  = fmt_ci(war_eff["est"],  war_eff["se"]),
+    interaction_p    = round(int_p, 3),
+    conflict_low     = fmt_ci(b("conflict_tierLow-level"), se("conflict_tierLow-level")),
+    conflict_war     = fmt_ci(b("conflict_tierWar"),       se("conflict_tierWar")),
+    cs_att    = fmt_ci(cs_simple_att, cs_simple_se),
+    sunab_att = fmt_ci(sa_att, sa_se),
+    effect_post_none_locked = fmt_ci(none_l["est"], none_l["se"]),
+    effect_post_low_locked  = fmt_ci(low_l["est"],  low_l["se"]),
+    effect_post_war_locked  = fmt_ci(war_l["est"],  war_l["se"]),
+    interaction_p_locked    = round(int_p_l, 3),
+    n_treated_locked_drop   = length(treated_no_base),
+    n_feols_obs = m$nobs, n_cs_obs = nrow(cs_feed),
+    cs_xformla = cs_xformla_used,
+    pt_original = pt_original, pt_twfe = pt_twfe, pt_cs = pt_cs,
+    cs_breakdown_mbar = cs_breakdown_str,
+    robust_ci_mbar1 = if (any(is.na(c(robust_lo, robust_hi)))) "—" else
+      sprintf("(%.2f, %.2f)", robust_lo, robust_hi)
+  )
+
+  list(main = main_row, cs_dynamic = cs_dynamic_df)
+}
+
+# run both grids
+run_grid <- function(disp_var, thresholds, growths, windows) {
+  raw <- expand_grid(t = thresholds, g = growths, w = windows) %>%
+    mutate(result = pmap(list(t, g, w),
+                         ~ run_did_threshold_model(vaccine_long_updated,
+                                                   disp_var, ..1, ..2, ..3))) %>%
+    dplyr::filter(!map_lgl(result, is.null))
+  list(
+    main = raw %>% mutate(main = map(result, "main")) %>%
+      dplyr::select(main) %>% unnest(main),
+    cs_dynamic = raw %>% mutate(cs = map(result, "cs_dynamic")) %>%
+      dplyr::filter(!map_lgl(cs, is.null)) %>%
+      dplyr::select(cs) %>% unnest(cs)
+  )
+}
+
+abs_results <- run_grid("unhcr_total_displaced",
+                        thresholds = c(50000, 150000, 250000, 500000, 750000, 1000000),
+                        growths = c(0.5, 1.0), windows = c(1, 3))
+pct_results <- run_grid("percent_pop_displaced",
+                        thresholds = c(0.25, 0.5, 1, 1.5, 2.5, 5, 10, 15),
+                        growths = c(0.5, 1.0), windows = c(1, 3))
+
+print(abs_results$main, width = Inf, n = Inf)
+print(pct_results$main, width = Inf, n = Inf)
+
+write.csv(abs_results$main,       "results/Table3_absolute_thresholds.csv", row.names = FALSE)
+write.csv(abs_results$cs_dynamic, "results/Table3_CS_eventstudy.csv",       row.names = FALSE)
+write.csv(pct_results$main,       "results/Table4_percent_thresholds.csv",  row.names = FALSE)
+write.csv(pct_results$cs_dynamic, "results/Table4_CS_eventstudy.csv",       row.names = FALSE)
+
+
+# ------------------------------------------------------------
+# 4. GAM DOSE-RESPONSE
+# ------------------------------------------------------------
+library(mgcv)
+
+PRIMARY_K <- 8   # k-sensitivity below defends this choice
+
+df_gam <- vaccine_long_updated %>%
+  mutate(
+    log_displacement = log1p(unhcr_total_displaced),
+    log_gdp = log1p(GDP_per_capita),
+    country = factor(Country.Code),
+    year    = factor(Year),
+    vaccine = factor(vaccine)
+  ) %>%
+  filter(!is.na(Coverage), !is.na(percent_pop_displaced),
+         !is.na(unhcr_total_displaced), !is.na(GDP_per_capita))
+
+gam_pct <- gam(Coverage ~ s(percent_pop_displaced, k = PRIMARY_K) +
+                 country + year + vaccine + log_gdp,
+               data = df_gam, method = "REML", select = TRUE)
+gam_abs <- gam(Coverage ~ s(log_displacement, k = PRIMARY_K) +
+                 country + year + vaccine + log_gdp,
+               data = df_gam, method = "REML", select = TRUE)
+
+# predictions at median GDP, country/year smooths excluded, averaged over
+# vaccines. (note: this conditions on reference levels rather than truly
+# marginalizing -- the curve shape is unaffected.)
+make_grid <- function(x_var, x_seq, data) {
+  expand.grid(
+    x_val   = x_seq,
+    log_gdp = median(data$log_gdp, na.rm = TRUE),
+    country = factor(levels(data$country)[1], levels = levels(data$country)),
+    year    = factor(levels(data$year)[1],    levels = levels(data$year)),
+    vaccine = factor(levels(data$vaccine),    levels = levels(data$vaccine))
+  ) %>% rename(!!x_var := x_val)
+}
+predict_marginal <- function(model, newdata) {
+  pr <- predict(model, newdata = newdata, se.fit = TRUE,
+                exclude = c("country", "year"))
+  newdata$fit <- pr$fit; newdata$se <- pr$se.fit
+  newdata
+}
+aggregate_curve <- function(grid, x_var) {
+  grid %>%
+    group_by(!!sym(x_var)) %>%
+    summarise(mean_fit = mean(fit), mean_se = mean(se), .groups = "drop") %>%
+    arrange(!!sym(x_var)) %>%
+    mutate(lower = mean_fit - 1.96 * mean_se, upper = mean_fit + 1.96 * mean_se)
+}
+
+pct_seq <- seq(0, min(50, max(df_gam$percent_pop_displaced, na.rm = TRUE)),
+               length.out = 200)
+agg_pct <- make_grid("percent_pop_displaced", pct_seq, df_gam) %>%
+  predict_marginal(gam_pct, .) %>%
+  aggregate_curve("percent_pop_displaced")
+
+abs_seq <- seq(min(df_gam$log_displacement), max(df_gam$log_displacement),
+               length.out = 200)
+agg_abs <- make_grid("log_displacement", abs_seq, df_gam) %>%
+  predict_marginal(gam_abs, .) %>%
+  aggregate_curve("log_displacement") %>%
+  mutate(displaced_persons = expm1(log_displacement))
+
+# where does the curve cross a 3pp / 5pp drop from baseline, and where
+# does it flatten out
+extract_inflections <- function(agg_data, x_col) {
+  agg <- agg_data %>% arrange(!!sym(x_col))
+  baseline <- agg$mean_fit[1]
+  plateau  <- min(agg$mean_fit, na.rm = TRUE)
+  cross_at <- function(drop_pp) {
+    hit <- which(agg$mean_fit <= baseline - drop_pp)
+    if (length(hit) == 0) NA_real_ else agg[[x_col]][hit[1]]
+  }
+  plateau_idx <- which(agg$mean_fit <= plateau + 0.5)
+  tibble(
+    baseline_pct  = round(baseline, 2),
+    plateau_pct   = round(plateau, 2),
+    total_drop_pp = round(baseline - plateau, 2),
+    x_at_3pp_drop = cross_at(3),
+    x_at_5pp_drop = cross_at(5),
+    plateau_onset_x = if (length(plateau_idx) > 0) agg[[x_col]][plateau_idx[1]] else NA_real_
+  )
+}
+
+inflections <- bind_rows(
+  extract_inflections(agg_pct, "percent_pop_displaced") %>%
+    mutate(axis = "percent displaced", .before = 1),
+  extract_inflections(agg_abs, "log_displacement") %>%
+    mutate(across(c(x_at_3pp_drop, x_at_5pp_drop, plateau_onset_x),
+                  ~ round(expm1(.), 0))) %>%
+    mutate(axis = "absolute displacement", .before = 1)
+)
+print(inflections)
+write.csv(inflections, "results/GAM_inflections.csv", row.names = FALSE)
+
+# k-sensitivity: thresholds should be stable across basis dimensions
+k_sensitivity <- function(k_val) {
+  mod <- tryCatch(
+    gam(Coverage ~ s(percent_pop_displaced, k = k_val) +
+          country + year + vaccine + log_gdp,
+        data = df_gam, method = "REML", select = TRUE),
+    error = function(e) NULL)
+  if (is.null(mod)) return(NULL)
+  agg <- make_grid("percent_pop_displaced", pct_seq, df_gam) %>%
+    predict_marginal(mod, .) %>%
+    aggregate_curve("percent_pop_displaced")
+  baseline <- agg$mean_fit[1]
+  tibble(k = k_val, aic = AIC(mod),
+         edf = summary(mod)$s.table[1, "edf"],
+         pct_at_3pp = agg$percent_pop_displaced[which(agg$mean_fit <= baseline - 3)[1]],
+         pct_at_5pp = agg$percent_pop_displaced[which(agg$mean_fit <= baseline - 5)[1]])
+}
+k_results <- map_dfr(c(4, 6, 8, 12, 18, 24, 36, 54), k_sensitivity)
+print(k_results)
+write.csv(k_results, "results/GAM_k_sensitivity.csv", row.names = FALSE)
+
+
+# ------------------------------------------------------------
+# 5. OMITTED-VARIABLE-BIAS SENSITIVITY (sensemakr)
+# ------------------------------------------------------------
+# the OVB target is the additive `post` coefficient (sensemakr needs one
+# treatment coef), fit on the same sample / FE / clustering as Table 3.
+library(sensemakr)
+
+build_did_frame <- function(df, abs_t, growth_t, window_size = 1) {
+  df %>%
+    group_by(Country.Code, vaccine) %>%
+    arrange(Year, .by_group = TRUE) %>%
+    mutate(
+      lag_total = dplyr::lag(unhcr_total_displaced),
+      growth = if_else(!is.na(lag_total) & lag_total > 0,
+                       (unhcr_total_displaced - lag_total) / lag_total, NA_real_),
+      shock = case_when(
+        is.na(growth) ~ 0L,
+        growth >= growth_t & unhcr_total_displaced >= abs_t ~ 1L,
+        TRUE ~ 0L)
+    ) %>%
+    group_by(Country.Code) %>%
+    mutate(
+      first_shock_year = if (any(shock == 1, na.rm = TRUE))
+        min(Year[shock == 1], na.rm = TRUE) else NA_real_,
+      treat = if_else(!is.na(first_shock_year), 1L, 0L),
+      event_time = Year - first_shock_year
+    ) %>%
+    ungroup() %>%
+    mutate(
+      post = if_else(!is.na(event_time) & event_time >= 0 &
+                       event_time < window_size, 1L, 0L),
+      conflict_tier = factor(case_when(
+        brd_new >= 1000 ~ "War",
+        brd_new >= 25   ~ "Low-level",
+        TRUE            ~ "None"), levels = c("None", "Low-level", "War")),
+      id_var = paste(Country.Code, vaccine, sep = "_")
+    ) %>%
+    dplyr::filter(treat == 0L |
+                    (treat == 1L & event_time >= -5 & event_time <= window_size - 1)) %>%
+    dplyr::filter(!is.na(Coverage), !is.na(post), !is.na(conflict_tier),
+                  !is.na(GDP_lag)) %>%
+    droplevels()
+}
+
+# the trick: two fits on an identical sample, differing only in vcov.
+# the iid fit feeds sensemakr (the Cinelli-Hazlett bias-bound geometry is
+# an OLS quantity and needs the classical residual SD), while the clustered
+# fit drives the actual inference and the headline robustness values.
+# mixing them inside one sensemakr call gives you wrong RVs.
+run_ovb_sensemakr <- function(df, abs_t, growth_t, window_size = 1,
+                              kd = 1:3, q = 1, alpha = 0.05, verbose = TRUE) {
+
+  df_mod <- build_did_frame(df, abs_t, growth_t, window_size)
+  if (sum(df_mod$post, na.rm = TRUE) == 0) return(NULL)
+
+  fml <- Coverage ~ post + conflict_tier + GDP_lag | id_var + Year
+  m_clust <- tryCatch(feols(fml, data = df_mod, cluster = ~Country.Code),
+                      error = function(e) NULL)
+  m_iid   <- tryCatch(feols(fml, data = df_mod, vcov = "iid"),
+                      error = function(e) NULL)
+  if (is.null(m_clust) || is.null(m_iid)) return(NULL)
+
+  b_post   <- unname(coef(m_clust)["post"])
+  se_clust <- unname(sqrt(diag(vcov(m_clust)))["post"])
+  G        <- n_distinct(df_mod$Country.Code)
+  dof_cl   <- G - 1L
+
+  bench <- c("GDP_lag", grep("^conflict_tier", names(coef(m_iid)), value = TRUE))
+  sens <- tryCatch(
+    sensemakr(model = m_iid, treatment = "post", benchmark_covariates = bench,
+              kd = kd, ky = kd, q = q, alpha = alpha, reduce = TRUE),
+    error = function(e) NULL)
+  if (is.null(sens)) return(NULL)
+
+  ss <- sens$sensitivity_stats; bd <- sens$bounds
+  rv_q_point <- as.numeric(ss$rv_q)   # nullifying the point is variance-invariant
+
+  # significance RV recomputed by hand under the clustered SE + G-1 dof --
+  # sensemakr's own rv_qa uses OLS residual dof and isn't cluster-robust
+  K_resid <- as.numeric(ss$se) * sqrt(as.numeric(ss$dof))
+  clustered_sig_rv <- function(estimate, se_cl, dof, K, alpha = 0.05) {
+    tcrit  <- qt(1 - alpha / 2, df = dof)
+    adj_se <- se_cl * sqrt(dof / (dof - 1))
+    f <- function(rv) (abs(estimate) - K * rv / sqrt(1 - rv)) - tcrit * adj_se
+    if (f(1e-9) <= 0) return(0)
+    tryCatch(uniroot(f, c(1e-9, 0.999))$root, error = function(e) NA_real_)
+  }
+  rv_qa_clust <- clustered_sig_rv(b_post, se_clust, dof_cl, K_resid, alpha)
+
+  if (verbose) {
+    cat(sprintf("\nOVB | abs>=%s, growth>=%s%%, window=%s\n",
+                format(abs_t, big.mark = ","), growth_t * 100, window_size))
+    cat(sprintf("post = %.3f | clustered SE = %.3f (dof %d) | classical SE = %.3f\n",
+                b_post, se_clust, dof_cl, as.numeric(ss$se)))
+    cat(sprintf("RV_q (point -> 0) = %.1f%% | RV_qa (sig -> 0, clustered) = %.1f%%\n",
+                100 * rv_q_point, 100 * rv_qa_clust))
+  }
+
+  pick_adj <- function(label) {
+    r <- bd[bd$bound_label == label, , drop = FALSE]
+    if (nrow(r) == 0) NA_real_ else as.numeric(r$adjusted_estimate[1])
+  }
+
+  tibble(
+    abs_threshold = abs_t, growth = paste0(growth_t * 100, "%"),
+    window = window_size, n_obs = m_clust$nobs, n_countries = G,
+    est_post = b_post, se_clustered = se_clust, se_classical = as.numeric(ss$se),
+    partial_r2_post = as.numeric(ss$r2yd.x),
+    RV_q_point      = rv_q_point,
+    RV_qa_clustered = rv_qa_clust,
+    adj_est_GDP_1x = pick_adj("1x GDP_lag"),
+    adj_est_GDP_3x = pick_adj("3x GDP_lag"),
+    adj_est_war_1x = pick_adj("1x conflict_tierWar"),
+    adj_est_war_3x = pick_adj("3x conflict_tierWar")
+  )
+}
+
+ovb_grid <- expand_grid(abs = c(50000, 250000, 500000, 750000),
+                        growth = c(0.50, 1.0), win = c(1, 3)) %>%
+  mutate(row = pmap(list(abs, growth, win),
+                    ~ run_ovb_sensemakr(vaccine_long_updated, ..1, ..2, ..3,
+                                        verbose = FALSE))) %>%
+  dplyr::filter(!map_lgl(row, is.null)) %>%
+  dplyr::select(row) %>% unnest(row)
+
+print(ovb_grid, width = Inf, n = Inf)
+write.csv(ovb_grid, "results/AppendixTable_OVB_sensemakr.csv", row.names = FALSE)
